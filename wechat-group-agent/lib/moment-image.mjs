@@ -7,11 +7,13 @@
 //  - nekosapi 可用（webp，微信文件对话框不认 webp → 必须转 jpg）
 //  - lolicon（pixiv 代理）在本网络全部超时，弃用
 //  - 微信只能发 jpg/png/gif；webp 会弹"格式不支持"提示框
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, existsSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { homedir } from 'node:os'
 import { execFileSync } from 'node:child_process'
+// Python 解释器不再写死（本机没有 D:\Python311，也不能指望 PATH 上一定有 python）
+import { resolvePythonExe } from './python-runtime.mjs'
 
 const DEFAULT_STYLE = '生活感照片，真实质感，自然光，构图干净；不要任何文字、水印、logo'
 
@@ -49,8 +51,12 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 
 export function normalizeToJpeg(src, dst, maxSide = 1600, quality = 88) {
   try {
+    // 解释器都解析不到就别 spawn 了（spawn 不存在的路径会变成异步 error 事件，风险 > 收益）
+    const py = resolvePythonExe()
+    if (!py) return false
     const script = join(HERE, 'normalize-image.py')
-    execFileSync('python', [script, src, dst, String(maxSide), String(quality)], { timeout: 60_000 })
+    if (!existsSync(script)) return false
+    execFileSync(py, [script, src, dst, String(maxSide), String(quality)], { timeout: 60_000, windowsHide: true })
     return true
   } catch {
     return false

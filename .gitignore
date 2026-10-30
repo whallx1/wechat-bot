@@ -44,3 +44,21 @@ scripts/gen-offset-patterns.py
 !release/rollback.ps1
 !release/README.txt
 !release/SHA256.txt
+
+# ── 本机补丁备份 / 更新临时文件（2026-10-31）──
+backups/
+agent/
+*.tar
+*.tmp
+
+# ── 微信数据库备份（私有数据，绝不入库）──
+backup-db*/
+*.db
+*.db-shm
+*.db-wal
+*.db-first.material
+*.db-incremental.material
+*.db-last.material
+*.kvdb
+*.kvdb-shm
+*.kvdb-wal

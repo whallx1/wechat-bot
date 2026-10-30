@@ -22,10 +22,12 @@ import { closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, rmSy
 import { dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { md5 } from './wechat-image.mjs'
+import { resolvePythonExe, pythonHint } from './python-runtime.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const BRIDGE_DIR = join(HERE, '..')
-const PY = process.env.PYTHON_EXE || 'D:\\Python311\\python.exe'
+function pyExe() { return resolvePythonExe() }
+const PY = resolvePythonExe() || ''   // 仅用于 paths 展示（解析不到就是空串）
 const SCRIPT = join(BRIDGE_DIR, 'decode-wechat-voice.py')
 const IMAGE_SCRIPT = join(BRIDGE_DIR, 'decode-wechat-image.py')
 const TMP_DIR = join(BRIDGE_DIR, '..', 'data', 'voice')
@@ -267,8 +269,10 @@ export function findVoiceFile(root, roomId, { nearTs = 0, toleranceMs = 30 * 60_
 
 /** 调 Python 解码器；返回 { ok, wav, out } —— 失败把 Python 的失败原因带回来 */
 function runDecoder(src, dst, extraArgs = []) {
+  const py = pyExe()
+  if (!py) return { ok: false, wav: null, out: '没找到可用的 Python 解释器；' + pythonHint() }
   try {
-    const out = execFileSync(PY, [SCRIPT, '--in', src, '--out', dst, ...extraArgs],
+    const out = execFileSync(py, [SCRIPT, '--in', src, '--out', dst, ...extraArgs],
       { windowsHide: true, timeout: 120_000, encoding: 'utf8', env: PY_ENV })
     return { ok: existsSync(dst) && statSync(dst).size > 44, wav: dst, out: String(out || '').trim() }
   } catch (e) {
@@ -303,6 +307,7 @@ export function pruneTemp(maxAgeMs = 60 * 60_000) {
  */
 export function decodeVoice(srcPath, { tag = 'voice', log = () => {} } = {}) {
   if (!existsSync(SCRIPT)) { log(`语音解码：解码脚本不存在（${SCRIPT}）`); return null }
+  if (!pyExe()) { log(`语音解码：没找到可用的 Python（${pythonHint()}）`); return null }
   if (!existsSync(srcPath)) { log(`语音解码：源文件不存在（${srcPath}）`); return null }
   mkdirSync(TMP_DIR, { recursive: true })
   try { const n = pruneTemp(); if (n) log(`语音临时目录：清掉 ${n} 个陈年 WAV`) } catch { /* ignore */ }
@@ -317,7 +322,9 @@ export function decodeVoice(srcPath, { tag = 'voice', log = () => {} } = {}) {
     log(`语音解码：源文件是 V2 加密容器（${srcPath.split(/[\\/]/).pop()}），先用图片链路剥壳…`)
     const bare = join(TMP_DIR, `${safe}.bare.bin`)
     try {
-      execFileSync(PY, [IMAGE_SCRIPT, srcPath, bare], { windowsHide: true, timeout: 120_000, encoding: 'utf8', env: PY_ENV })
+      const py = pyExe()
+      if (!py) { log(`语音解码：没找到可用的 Python（${pythonHint()}）`) }
+      else execFileSync(py, [IMAGE_SCRIPT, srcPath, bare], { windowsHide: true, timeout: 120_000, encoding: 'utf8', env: PY_ENV })
       if (existsSync(bare) && statSync(bare).size > 256) { feed = bare; note = 'V2剥壳后' }
       else { log('语音解码：V2 剥壳没产出内容（密钥可能失效）') }
     } catch (e) {

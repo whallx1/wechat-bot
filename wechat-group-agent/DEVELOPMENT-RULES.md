@@ -92,3 +92,21 @@ if (ROOM !== 'filehelper') { console.error('❌ 只能发文件传输助手'); p
 **顺带记一个协议坑**：桥的 WS 消息是**扁平参数**（`const { id, op, ...args } = msg`），
 不是 `{ id, op, args: {...} }`。写调试脚本时传错，参数全变 undefined，
 表现为"文本为空 / 用了默认值"（我今天就踩了：语音报"文本为空"，刷抖音 count 传 2 却刷了 8 条）。
+
+## R20：改完 `panel/index.html` 必须重跑 `node build-client.mjs`
+
+面板有**两份**：源码 `panel/index.html` 和打包产物 `lib/client.js`。
+DSH 界面里真正渲染的是 `client.js`（`build-client.mjs` 把 html 的 `<style>/<body>/<script>`
+三段塞进 React 壳），`/wechat-bot` 那个独立页面才直接读 html。
+
+**症状（极具迷惑性）**：热重载后插件日志明明打印了新代码在跑、
+op 白名单自检也显示 `61/61 ✅`，但界面上就是没有新加的标签页/按钮——因为浏览器拿到的是旧 `client.js`。
+
+**规矩**：任何一次改 `panel/index.html`（哪怕只加一行 NAV），收尾必须执行：
+
+```bash
+node build-client.mjs     # 在 wechat-group-agent/ 下跑
+```
+
+然后再让浏览器**硬刷新**（或热重载插件）。`scripts/test-all.mjs` 的「面板产物一致」
+只比对了 6 个历史符号，覆盖不到新增页面，别指望它会提醒你。

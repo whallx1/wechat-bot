@@ -117,8 +117,13 @@ AI 拿到这段指令后会自己：查环境 → 装依赖 → 复制独立微�
     apiPort           | 30001                | —    | Hook 的 HTTP 端口。改了要同步 WECHAT_HOOK_PORT。
     cbPort            | 18998                | —    | 回调端口。改了要同步 WECHAT_CB_PORT。
     bridgePort        | 17300                | —    | 接入层端口（插件/agent 连这个）。改了要同步 WECHAT_BOT_PORT。
-    pythonExe         | "python"             | ○    | Python 解释器。建议写成绝对路径，
-                                                     并同时设环境变量 PYTHON_EXE（代码里的兜底值是硬编码的 D:\Python311\python.exe）。
+    pythonExe         | "python"             | ○    | Python 解释器（建议写成绝对路径，同时设环境变量 PYTHON_EXE）。
+                                                     ℹ️ config.json 里的 pythonExe 是 pythonPath 的**兼容别名，仍然生效**；
+                                                     新配置请统一用 pythonPath。两者都填且都非空时 **pythonPath 优先**。
+                                                     实际解析顺序：PYTHON_EXE 环境变量 →
+                                                     config.json 的 pythonPath → config.json 的 pythonExe（别名）→ 自动探测
+                                                     （C:\Python3xx / uv 装的解释器 / PATH 上的 python / py -3）→
+                                                     全都找不到就降级（不再有硬编码兜底路径）。
     dataDir           | "./data"             | —    | 数据目录（表情包库/日志）。server.mjs 当前不读它，实际用 --data-dir= 或 WECHAT_BOT_DATA。
     wechatAttachDir   | ""                   | —    | ⚠️ 这个字段【没有任何代码读它】，填了也不生效。
                                                      真正生效的是环境变量 WECHAT_ATTACH_DIR（只被 decode-wechat-image.py 读取）。
@@ -140,9 +145,16 @@ AI 拿到这段指令后会自己：查环境 → 装依赖 → 复制独立微�
       setx WECHAT_EXE        "D:\wxhook\wx4110\Weixin.exe"
         → 机器人专用微信的 exe。scripts/start-bot.ps1 用它拉起客户端；decode-wechat-image.py 用它
           定位"只扫这个进程"，绝不碰日常微信。
-    强烈建议设（不设会走硬编码兜底路径，容易踩坑）：
+    强烈建议设（不设也能用，会自动探测）：
       setx PYTHON_EXE        "<python.exe 绝对路径>"
-        → wx-bridge 调所有 Python 脚本时用它。不设时代码兜底是硬编码的 D:\Python311\python.exe。
+        → wx-bridge 调所有 Python 脚本时用它，优先级最高。
+          不设时的解析顺序：config.json 的 pythonPath → 自动探测
+          （C:\Python3xx / uv 装的解释器 / PATH 上的 python / py -3）→ 都找不到就降级（不再硬编码兜底）。
+    建议顺带设（本机装了 Clash 等系统代理时必设，否则本地服务会被代理劫持）：
+      setx NO_PROXY          "127.0.0.1,localhost"
+        → Python 的 urllib/requests 会读 HTTP_PROXY；NO_PROXY 为空时连 http://127.0.0.1:9880
+          （GPT-SoVITS）都会被送进代理，表现为 502 Bad Gateway。
+          注意 Node 侧的 fetch 不走这套 env，只有 Python 脚本受影响。
     按需：
       setx WECHAT_SELF_WXID  "<机器人自己的 wxid>"
         → 明确"我是谁"。不设时靠自动探测（self 未知时"被 @ 必回"判定可能不准）。
@@ -381,7 +393,7 @@ notepad config.json
 | `apiPort` | `30001` | 一般不改 | Hook 的 HTTP 端口 | 若与其它程序冲突，改这里并同步 `WECHAT_HOOK_PORT` |
 | `cbPort` | `18998` | 一般不改 | Hook 回调端口 | 冲突时同步 `WECHAT_CB_PORT` |
 | `bridgePort` | `17300` | 一般不改 | 接入层端口（插件/MCP 连这个） | 冲突时同步 `WECHAT_BOT_PORT` |
-| `pythonExe` | `"python"` | 建议改 | `python.exe` 的**绝对路径** | 代码里的兜底是硬编码的 `D:\Python311\python.exe`；不是这个路径就会调用失败 → 识图/语音/视频全废 |
+| `pythonExe` | `"python"` | 可不改 | — | ℹ️ **兼容别名**，等价于 `pythonPath`，**仍然生效**；新配置建议统一用 `pythonPath`（两者都填且都非空时 **`pythonPath` 优先**）。真正生效的解析顺序：`PYTHON_EXE` → `pythonPath` → `pythonExe`（别名）→ 自动探测（`C:\Python3xx` / uv 装的解释器 / PATH 上的 `python` / `py -3`）→ 优雅降级；**不再有硬编码兜底路径**（旧版写死 `D:\Python311\python.exe`，该目录被删后直接 spawn ENOENT 崩宿主，已修） |
 | `dataDir` | `"./data"` | 不改 | 数据目录（表情包库、日志、临时文件） | server.mjs 也不读它；实际用 `--data-dir=` 或 `WECHAT_BOT_DATA` |
 | `wechatAttachDir` | `""` | **不用改** | — | ⚠️ **没有任何代码读这个字段**。要指定 attach 目录请用环境变量 `WECHAT_ATTACH_DIR` |
 | `hosted.enabled` | `false` | **按需**（用外部 agent 才开） | 用托管模式 → `true`；用 DSH 插件 → 保持 `false` | 与 DSH 插件同时开 → **每条消息回复两次** |
@@ -401,7 +413,8 @@ notepad config.json
 | 变量 | 默认 / 兜底 | 作用 | 代码出处 |
 |---|---|---|---|
 | `WECHAT_EXE` | 无（`start-bot.ps1` 里必填） | 机器人专用微信 exe。用于拉起客户端；也是 `decode-wechat-image.py` 定位"只扫这个进程"的依据 | `scripts/start-bot.ps1`、`wx-bridge/decode-wechat-image.py` |
-| `PYTHON_EXE` | 硬编码兜底 `D:\Python311\python.exe` | 所有 Python 脚本调用的解释器 | `wechat-image.mjs` / `wechat-voice.mjs` / `wechat-video.mjs` / `tts.mjs` / `server.mjs` |
+| `PYTHON_EXE` | 无硬编码兜底：依次尝试 `config.json` 的 `pythonPath` → 自动探测（`C:\Python3xx` / uv 装的解释器 / PATH 上的 `python` / `py -3`） | 所有 Python 脚本调用的解释器（本变量优先级最高） | `lib/python-runtime.mjs`（由 `wechat-image.mjs` / `wechat-voice.mjs` / `wechat-video.mjs` / `link-video.mjs` / `tts.mjs` / `server.mjs` 统一调用） |
+| `NO_PROXY` | 无（若为空，本机代理会劫持 localhost） | 设为 `127.0.0.1,localhost`：让 Python 的 urllib/requests **不要**把本地服务（如 GPT-SoVITS 的 9880）送进系统代理。为空时表现为 `HTTP Error 502: Bad Gateway` | Python 运行时的标准行为（`tts-silk.py` 等脚本） |
 | `WECHAT_SELF_WXID` | 无（靠自动探测） | 明确"机器人自己是谁"；不设时 self 未知会导致"被 @ 必回"判定不准 | `wx-bridge/lib/wechat-hook.mjs` |
 | `WECHAT_ATTACH_DIR` | 空 | 微信数据目录下的 `msg\attach`，用于扫图片解密密钥/兜底找文件 | `wx-bridge/decode-wechat-image.py` |
 | `WECHAT_DATA_ROOT` | 空（自动从 DB PRAGMA 反推） | 微信数据根目录（含 `msg\attach`） | `wx-bridge/lib/wechat-image.mjs` |

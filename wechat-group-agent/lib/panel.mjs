@@ -45,6 +45,9 @@ const ALLOWED_OPS = new Set([
   'outbox.stats',          // ★ 出站队列状态
   'persona.addTerm',      // ★ 手动加群梗
   'persona.removeTerm',   // ★ 删群梗      // ★ 2026-10-27：TTS 服务（GPT-SoVITS）状态/启停/重启/试合成
+  // ★ 2026-10-30：定时任务（面板「⏰ 定时任务」页）
+  'schedule.list', 'schedule.save', 'schedule.remove', 'schedule.toggle',
+  'schedule.run', 'schedule.preview', 'schedule.clearLog',
 ])
 
 /**
@@ -495,6 +498,9 @@ export function setupPanel(ctx, api) {
       names: api.nameCounts?.() || null,
       paths: { config: api.configFile, memory: api.memoryDir, log: api.logFile, bridgeLogDir: api.bridgeLogDir || '' },
       selfCheck: api.selfCheckInfo?.() || null,
+      // 定时任务：任务清单 + 最近运行记录（面板「⏰ 定时任务」页直接用）
+      schedules: (api.schedules?.() || []),
+      scheduleLog: (api.scheduleLog?.() || []),
     }
   }
 

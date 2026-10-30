@@ -24,8 +24,12 @@ import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PLUGIN = join(HERE, '..')
-const DATA = join(PLUGIN, '..', 'data')
+const REPO = join(PLUGIN, '..')
+const DATA = join(REPO, 'data')
 const FAST = process.argv.includes('--fast')
+const PANEL_OPS_CHECK = existsSync(join(HERE, 'check-panel-ops.mjs'))
+  ? join(HERE, 'check-panel-ops.mjs')
+  : join(REPO, 'scripts', 'check-panel-ops.mjs')
 
 let failed = 0
 const results = []
@@ -50,6 +54,7 @@ run('语法检查', () => {
   const files = [
     'lib/index.js', 'lib/persona.mjs', 'lib/memory-v2.mjs', 'lib/human2.mjs',
     'lib/outbox.mjs', 'lib/panel.mjs', 'lib/panel-meta.mjs',
+    'lib/scheduler.mjs', 'lib/weather.mjs',   // 2026-10-30 定时任务
   ]
   const bad = []
   for (const f of files) {
@@ -69,10 +74,10 @@ run('语法检查', () => {
 })
 
 // ② 作用域检查（专防"引用别处变量"）
-run('提示词作用域', () => sh(process.execPath, [join(HERE, 'check-prompt-scope.mjs')]))
+run('提示词作用域', () => sh(process.execPath, [join(HERE, 'check-prompt-scope.mjs'), join(PLUGIN, 'lib', 'index.js')]))
 
 // ③ 面板操作白名单
-run('面板操作白名单', () => sh(process.execPath, [join(HERE, 'check-panel-ops.mjs')]))
+run('面板操作白名单', () => sh(process.execPath, [PANEL_OPS_CHECK]))
 
 // ④ 面板与产物一致性
 run('面板产物一致', () => {
@@ -83,6 +88,9 @@ run('面板产物一致', () => {
   if (bad.length) throw new Error('html 与 client.js 不一致：' + bad.join(', ') + '（忘了 build-client？）')
   return marks.length + ' 个符号一致'
 })
+
+// 已随插件发布的策略回归也必须执行，避免测试目录缺失时漏测。
+run('拟人策略回归', () => sh(process.execPath, [join(PLUGIN, 'lib', 'test-policy.mjs')]))
 
 // ⑤ 单元测试
 const testFiles = existsSync(DATA)

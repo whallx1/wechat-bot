@@ -411,6 +411,23 @@ export const CONFIG_META = {
   voiceSayMaxChars: {
     group: 'voiceOut', label: '超过多少字改文字', type: 'number', min: 1, max: 300, step: 5, unit: '字',
   },
+  // ── 外部运行环境（TTS 后台服务用）────────────────────────────
+  // ★ 2026-10-28：这两个路径原先**写死在代码里**（D:\Python311\python.exe 与 D:\微信deepseek\data\GPT-SoVITS），
+  //   换台机器/删个目录就会 spawn ENOENT 把宿主带崩。现在留空即"自动探测"，
+  //   这里给需要固定解释器或模型目录的用户一个**可见可改**的入口。
+  //   之所以放在「语音发送（说）」组：它们只服务于 GPT-SoVITS 这条链路。
+  pythonPath: {
+    group: 'voiceOut', label: 'Python 解释器路径', type: 'text',
+    help: '跑 api_v2.py 用的 python.exe 绝对路径。留空 = 自动探测'
+      + '（C:\\Python3xx → uv 装的解释器 → PATH 上的 python → py -3）。'
+      + '填了但路径不存在时不会崩，会写一条日志然后继续自动探测。示例：C:\\Python312\\python.exe',
+  },
+  gptSovitsDir: {
+    group: 'voiceOut', label: 'GPT-SoVITS 目录', type: 'text',
+    help: 'api_v2.py 所在的目录（该目录下必须真的有 api_v2.py）。留空 = 先看环境变量 GPT_SOVITS_DIR，'
+      + '再退回历史默认值。目录不存在时插件照常启动，只是语音功能降级为发文字。'
+      + '示例：D:\\GPT-SoVITS',
+  },
 
   // ── 记忆与检索 ──────────────────────────────────────────────
   memoryExtract: {
@@ -644,6 +661,33 @@ export const CONFIG_META = {
   memberNames: {
     group: 'identity', label: 'wxid ↔ 昵称映射', type: 'map', hidden: true,
   },
+
+  // ── 定时任务（2026-10-30）───────────────────────────────────
+  // 任务本身在 schedules.json、在「⏰ 定时任务」页里管；这里只放调度器自身的开关。
+  schedulerEnabled: {
+    group: 'advanced', label: '定时任务总开关', type: 'bool', def: true,
+    help: '关掉后所有定时任务都不跑（任务保留，改回来就恢复）。',
+  },
+  schedulerCheckMs: {
+    group: 'advanced', label: '定时任务检查间隔', type: 'number', min: 5000, max: 600000, step: 5000, unit: 'ms',
+    help: '多久看一次"有没有任务到点"。默认 30 秒（任务精度到分钟，够用；改完重载插件生效）。',
+  },
+  schedulerCatchUpMs: {
+    group: 'advanced', label: '错过多久就不补跑', type: 'number', min: 0, max: 86400000, step: 600000, unit: 'ms',
+    help: '比如关机一整天，晚上开机时不该再补发"早上 9 点的天气"。默认 6 小时。',
+  },
+  schedulerRespectQuiet: {
+    group: 'advanced', label: '定时任务遵守安静时段', type: 'bool', def: false,
+    help: '默认关：你自己定的提醒，不该被作息时段吞掉。任务的「忽略安静时段」优先级更高。',
+  },
+  weatherCity: {
+    group: 'advanced', label: '默认城市（查天气）', type: 'text',
+    help: '「查天气」任务没单独填城市时用这个。数据来自 open-meteo（免费、免密钥）。',
+  },
+  schedulerDefaultRoom: {
+    group: 'advanced', label: '定时任务默认群', type: 'text',
+    help: '任务没指定群时发到这个群（群名或 roomId）。留空 = 最近活跃的群。',
+  },
 }
 
 /**
@@ -670,6 +714,7 @@ export const FEATURES = [
   { id: 'douyin', icon: '🎵', title: '抖音分享', key: 'douyinShare', kind: 'bool', desc: '只读刷推荐，挑一条发群里', risk: 'high', related: ['douyinShareIntervalMs'] },
   { id: 'selfheal', icon: '🚨', title: '受限自愈', key: 'selfHeal', kind: 'bool', desc: '仅 hook 死锁时安全重启客户端', risk: 'critical', related: [] },
   { id: 'dbMembers', icon: '👥', title: '数据库成员名', key: 'useDbMembers', kind: 'bool', desc: '用真实群昵称识别 @ 与点名', related: [] },
+  { id: 'scheduler', icon: '⏰', title: '定时任务', key: 'schedulerEnabled', kind: 'bool', desc: '到点自动发：天气 / 打卡签到提醒 / 自定义提醒', related: ['schedulerCheckMs', 'weatherCity'] },
 ]
 
 /** 给前端用的精简元数据（去掉函数等）。 */

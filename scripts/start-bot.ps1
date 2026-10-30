@@ -18,14 +18,28 @@ $RepoRoot  = Split-Path -Parent $PSScriptRoot                 # scripts/ 的上�
 $BridgeDir = Join-Path $RepoRoot 'wx-bridge'
 $DataDir   = if ($env:WECHAT_BOT_DATA)  { $env:WECHAT_BOT_DATA }  else { Join-Path $BridgeDir 'data' }
 $WxExe     = $env:WECHAT_EXE
+if (-not $WxExe) {
+  # 默认值 = 本机这套 version.dll 代理式 hook 的客户端（D:\wxhook\wx4110）
+  $autoExe = 'D:\wxhook\wx4110\Weixin.exe'
+  if (Test-Path $autoExe) { $WxExe = $autoExe }
+}
 $BotPort   = if ($env:WECHAT_BOT_PORT)  { $env:WECHAT_BOT_PORT }  else { 17300 }
 $HookPort  = if ($env:WECHAT_HOOK_PORT) { $env:WECHAT_HOOK_PORT } else { 30001 }
 $CbPort    = if ($env:WECHAT_CB_PORT)   { $env:WECHAT_CB_PORT }   else { 18998 }
+
+# ── transport 必须和微信客户端的 hook 方式匹配，否则桥起不来 ──
+#   wechat-hook : version.dll 代理式（客户端目录里有 version.dll，HTTP 30001，无需注入）
+#   wxhelper    : 需要往已登录的微信主进程**注入** wxhook.dll（客户端目录里没有 version.dll）
+# 历史上这里没传 --transport，server.mjs 就默认走 wxhelper，对 version.dll 这套客户端必然注入失败 → 桥退出。
+$Transport = if ($env:WECHAT_BOT_TRANSPORT) { $env:WECHAT_BOT_TRANSPORT }
+             elseif ($WxExe -and (Test-Path (Join-Path (Split-Path -Parent $WxExe) 'version.dll'))) { 'wechat-hook' }
+             else { 'wxhelper' }
 
 Write-Host '============================================================'
 Write-Host ' 微信机器人 · 一键启动'
 Write-Host "   微信客户端 : $(if ($WxExe) { $WxExe } else { '(未设置 WECHAT_EXE)' })"
 Write-Host "   hook API   : 127.0.0.1:$HookPort    回调 : http://127.0.0.1:$CbPort"
+Write-Host "   transport  : $Transport"
 Write-Host "   bridge     : 127.0.0.1:$BotPort    (DSH 里的插件连这个)"
 Write-Host "   数据目录   : $DataDir"
 Write-Host '============================================================'
@@ -66,7 +80,7 @@ if ($listening) {
   Write-Host ''
   Set-Location $BridgeDir
   # 注意 --data-dir= 必须用等号：server.mjs 的 opt() 只认 --key=value 形式
-  & node server.mjs --transport=wechat-hook "--api-port=$HookPort" "--cb-port=$CbPort" "--data-dir=$DataDir" "--wechat=$WxExe"
+  & node server.mjs "--transport=$Transport" "--api-port=$HookPort" "--cb-port=$CbPort" "--data-dir=$DataDir" "--wechat=$WxExe"
   Write-Host ''
   Write-Host "bridge 已退出（退出码 $LASTEXITCODE）"
 }

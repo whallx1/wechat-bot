@@ -30,6 +30,8 @@ import { createHash, randomUUID } from 'node:crypto'
 import { BridgeClient } from './bridge-client.mjs'
 import { pickMomentImage } from './moment-image.mjs'
 import { createPetBridge } from './pet-bridge.mjs'
+import { createScheduler, describeWhen } from './scheduler.mjs?v=sch1'   // 定时任务调度内核（?v= 打破 ESM 缓存）
+import { fetchWeather, composeWeatherBrief } from './weather.mjs?v=sch2'   // 取天气 + 本地拼「天气/穿搭/运势」
 // 配置元数据先静态拿一份（校验用）；真正挂面板时会用带 cache-bust 的动态 import
 // 再加载一份最新的（热重载后改了 label/范围不用重启 DSH）。
 import { CONFIG_META as STATIC_CONFIG_META } from './panel-meta.mjs'
@@ -39,6 +41,14 @@ import {
   pickProactive, inActiveHours, parseStickerDirective, stripStickerDirective,
   parseSearchDirective, stripSearchDirective, parseMemoryDirective, parseLaterDirective,
 } from './policy.mjs'
+// Python 解释器统一解析：环境变量 → DSH 配置 pythonPath → 自动探测 → null。
+// TTS 启动前必须校验解释器/脚本，并监听 child.error，避免 ENOENT 打死 DSH 宿主。
+import { resolvePython, describePython, invalidatePythonCache, pythonHint } from './python-runtime.mjs'
+
+/** 任务时间的人话描述（"每天 09:30"）。包一层：描述坏了也不能让主流程崩。 */
+const describeWhenSafe = (when) => {
+  try { return String(describeWhen(when) || '') } catch { return String(when?.kind || '') }
+}
 
 // 模块级探针：宿主是否真的求值了本模块（排查"改了代码不生效"用；正常无副作用）
 try {
@@ -357,6 +367,8 @@ const DEFAULT_CONFIG = {
   voiceSay: false,                 // 总开关（默认**关**：先自测通过再开）
   voiceModelOn: true,               // 语音模型：true=常驻（时刻准备）/ false=关闭（省 GPU）
   voicePreset: '雌小鬼·A（当前）',  // 音色预设（当前用 GPT-SoVITS）
+  pythonPath: '',                  // 空值自动探测；不要写死已删除的 Python 安装路径
+  gptSovitsDir: '',                // api_v2.py 所在目录（可用 GPT_SOVITS_DIR 环境变量）
   // 更新检查的自定义版本源（不依赖 GitHub）：逗号分隔 URL，返回 {"version":"1.3.x"} 即采用。
   // 适合自建对象存储 / 局域网共享 / 别的托管；也可填第三方镜像。
   updateMirror: '',
@@ -554,6 +566,15 @@ const DEFAULT_CONFIG = {
   momentChatDebounceMs: 90_000,   // 群里安静多久后才评估（等对话自然停下，避免打断）
   momentChatCooldownMs: 1_800_000,// 同一个群两次评估的最小间隔（30 分钟）
   momentChatRooms: [],            // 只看这些群（空 = 所有接入的群）
+  // ── 定时任务（2026-10-30）：到点自动往群里发东西（天气/提醒/打卡签到…）──────
+  // 任务本身存在 <dshHome>/wechat-bot/schedules.json（不进 config.json，避免一个任务写坏把整体配置拖死），
+  // 这里只放"调度器本身"的开关和默认项。
+  schedulerEnabled: true,         // 总开关：关了所有定时任务都不跑（任务保留）
+  schedulerCheckMs: 30_000,       // 到点检查间隔 30 秒（任务精度到分钟，30 秒足够且开销小）
+  schedulerCatchUpMs: 6 * 3_600_000, // 错过多久就不补跑了：关机一整天的人，不该在晚上收到"早上 9 点的天气"
+  schedulerRespectQuiet: false,   // false = 安静时段也照发（用户自己定的提醒，不该被作息吞掉）；true = 遵守 quietHours
+  weatherCity: '石河子',           // 「查天气」任务的默认城市（每个任务还能单独改）
+  schedulerDefaultRoom: '',       // 任务没指定群时的兜底群（空 = 唯一群 / 最近活跃的群）
   // 记忆与日志
   contextMessages: 24,
   historyLookup: true,             // 群里提起以前的事时，从微信数据库翻历史（本地查询，0 token）
@@ -584,7 +605,7 @@ export function apply(ctx, rawConfig) {
 function applyInner(ctx, rawConfig) {
   const config = { ...DEFAULT_CONFIG, ...(rawConfig ?? {}) }
   const SHORT = 'dsh-wechat-bot'
-const BUILD_VER = '2026-10-23.4'   // 抬版本：让新实例压过热重载残留的旧实例   // 带版本号的实例才允许踢掉旧连接（旧代码没这个字段）
+const BUILD_VER = '2026-10-30.4'   // 抬版本：让新实例压过热重载残留的旧实例（天气简报：天气+穿搭+运势 本地拼装）   // 带版本号的实例才允许踢掉旧连接（旧代码没这个字段）
   const dshHome = process.env.DSH_HOME || join(homedir(), '.dsh')
   // ★ 持久化：把 wechat_bot_config 改过的值存到文件，重载插件后自动读回来。
   //   （以前纯内存，重载/重启 DSH 就全部回落默认，每次都要重设一遍。）
@@ -749,6 +770,10 @@ const BUILD_VER = '2026-10-23.4'   // 抬版本：让新实例压过热重载残
       running, pids, port: TTS_PORT(), portAlive,
       configOn: config.voiceModelOn !== false,
       api: TTS_API(),
+      python: describePython(),
+      sovitsDir: gptSovitsDir(),
+      sovitsScript: join(gptSovitsDir(), 'api_v2.py'),
+      sovitsReady: existsSync(join(gptSovitsDir(), 'api_v2.py')),
       vits: ttsVitsFromLog(),      // 当前音色模型（名字+路径）；换音色一眼可见
       last: { ...ttsLast },
     }
@@ -798,29 +823,73 @@ const BUILD_VER = '2026-10-23.4'   // 抬版本：让新实例压过热重载残
    * ★ 把服务端 stdout/stderr 落到 data\logs\tts-api.log —— 上次"进程活着但合成全 400"
    *   就是因为 stdio 丢掉，看不到 traceback，只能靠猜。
    */
+  const warnedOnce = new Set()
+  function warnOnce(key, msg) {
+    if (warnedOnce.has(key)) return
+    warnedOnce.add(key)
+    log(msg)
+  }
+
+  function gptSovitsDir() {
+    return String(config.gptSovitsDir || process.env.GPT_SOVITS_DIR || '').trim()
+      || 'D:\\微信deepseek\\data\\GPT-SoVITS'
+  }
+
   function ttsSpawn() {
+    const py = resolvePython({ log })
+    if (!py) {
+      const msg = 'TTS：没找到可用的 Python，无法启动 api_v2（' + pythonHint()
+        + '；面板「语音发送（说）」→「Python 解释器路径」也能填）'
+      warnOnce('tts:no-python', msg)
+      return { ok: false, error: '未找到可用的 Python 解释器；' + pythonHint() }
+    }
+
+    const workDir = gptSovitsDir()
+    const script = join(workDir, 'api_v2.py')
+    if (!existsSync(workDir) || !existsSync(script)) {
+      // ★ 提示语必须指向**真实存在**的位置（2026-10-28 QA 回归指出：曾经写了"请在面板配"，
+      //   但面板当时并没有这个开关）。现在面板「语音发送（说）」组里确实有「GPT-SoVITS 目录」这一项。
+      const msg = 'TTS：GPT-SoVITS 不在预期位置（找的是 ' + script + '），语音功能暂不可用'
+        + '；请到面板「语音发送（说）」→「GPT-SoVITS 目录」填 api_v2.py 所在的目录，'
+        + '或直接改 ' + join(dshHome, 'wechat-bot', 'config.json') + ' 里的 gptSovitsDir'
+      warnOnce('tts:no-sovits', msg)
+      return { ok: false, error: 'GPT-SoVITS 目录缺失：' + workDir }
+    }
+
     const logDir = join(dirname(memoryDir), 'logs')
     try { mkdirSync(logDir, { recursive: true }) } catch { /* ignore */ }
     const outLog = join(logDir, 'tts-api.log')
     const errLog = join(logDir, 'tts-api.log.err')
+    // ★ fd 必须在 try 外面声明：spawn 有**同步**失败路径（例如解释器存在但不是 PE 文件 →
+    //   errno -4094 UNKNOWN），那时 openSync 已经把两个句柄打开了，若 catch 里不关，
+    //   每点一次"启动"就泄漏 2 个 fd，反复重试会把进程掏空（2026-10-28 QA 实测）。
+    let out = -1
+    let err = -1
     try {
-      const out = openSync(outLog, 'a')
-      const err = openSync(errLog, 'a')
-      const child = spawnCb(
-        'D:\\Python311\\python.exe',
-        ['D:\\微信deepseek\\data\\GPT-SoVITS\\api_v2.py'],
-        {
-          cwd: 'D:\\微信deepseek\\data\\GPT-SoVITS',
-          detached: true,
-          windowsHide: true,
-          stdio: ['ignore', out, err],
-        },
-      )
+      out = openSync(outLog, 'a')
+      err = openSync(errLog, 'a')
+      const child = spawnCb(py.exe, [script], {
+        cwd: workDir,
+        detached: true,
+        windowsHide: true,
+        stdio: ['ignore', out, err],
+      })
+      child.on('error', (e) => {
+        try { closeSync(out); closeSync(err) } catch { /* ignore */ }
+        warnOnce('tts:spawn-error', 'TTS：api_v2 启动失败（' + String(e?.message || e).slice(0, 200) + '）；解释器=' + py.exe + '，脚本=' + script)
+      })
       child.on('exit', (code) => { try { closeSync(out); closeSync(err) } catch { /* ignore */ } ; log('TTs api_v2 退出，code=' + code + '（看 data\\logs\\tts-api.log.err）') })
       child.unref()
-      log('TTS api_v2 已启动（日志 → ' + outLog + '）')
-      return { ok: true, log: outLog }
-    } catch (e) { return { ok: false, error: String(e?.message || e).slice(0, 160) } }
+      log('TTS api_v2 已启动（解释器 ' + py.exe + '（' + py.source + '），日志 → ' + outLog + '）')
+      return { ok: true, log: outLog, python: py.exe }
+    } catch (e) {
+      // 同步失败（UNKNOWN/EACCES/EMFILE…）：把手已经打开的句柄关掉，别泄漏
+      try { if (out >= 0) closeSync(out) } catch { /* ignore */ }
+      try { if (err >= 0) closeSync(err) } catch { /* ignore */ }
+      const reason = String(e?.message || e).slice(0, 160)
+      warnOnce('tts:spawn-throw', 'TTS：api_v2 启动失败（同步异常：' + reason + '）；解释器=' + py.exe + '，脚本=' + script)
+      return { ok: false, error: reason }
+    }
   }
 
   /** 停：杀进程并等它真的消失（异步，最多 8 秒）*/
@@ -930,6 +999,11 @@ const BUILD_VER = '2026-10-23.4'   // 抬版本：让新实例压过热重载残
       } else {
         log('语音模型：已取消"开机自启"（当前进程不动，要停请点面板「停止」）')
       }
+    }
+
+    if (applied.some((x) => x.key === 'pythonPath' || x.key === 'gptSovitsDir')) {
+      invalidatePythonCache()
+      warnedOnce.clear()
     }
 
     // 朋友圈参数一变就重新排期 —— 否则用户把间隔调短了，还要等旧的 nextAt 到点才生效
@@ -3266,7 +3340,60 @@ ${cur.text}`
     } catch { /* ignore */ }
     if (lastTextRoute) return lastTextRoute
       if (lastRoute && (!config.visionModel || lastRoute.model !== config.visionModel)) return lastRoute
-    throw new Error('无法确定 LLM 路由（可在插件配置里显式指定 provider/model）')
+    // ★ 最后兜底：后台自动探到的路由（DSH 当前选择 / 第一个可用 provider 的第一个模型）
+    if (routeFallback) return routeFallback
+    void refreshRouteFallback(true)     // 同步拿不到，踢一次异步探测，下次调用就有
+    throw new Error('无法确定 LLM 路由：面板「人设模型」页指定一个 provider/model 即可（DSH 本体也没设默认模型）')
+  }
+
+  /**
+   * LLM 路由兜底（2026-10-30）
+   *
+   * ★ 事故：用户把 provider/model 清空（想"跟随 DSH"），但 DSH 本体也没设默认模型，
+   *   于是 resolveRoute() 抛异常 → **所有 LLM 功能全哑**：定时任务「AI 现写」报
+   *   "内容为空，跳过"、印象生成失败、主动发言失败……而且报错看不出根因。
+   *
+   * 办法：异步探一次可用路由缓存起来，resolveRoute 把它当最后兜底。
+   * 顺序：DSH 当前选择 > 第一个已注册 provider 的第一个模型。
+   * 缓存 10 分钟；provider 列表是同步的，只有 listModels 要 await，所以只能在异步里做。
+   */
+  let routeFallback = null
+  let routeFallbackAt = 0
+  async function refreshRouteFallback(force = false) {
+    const now = Date.now()
+    if (!force && routeFallbackAt && now - routeFallbackAt < 600_000) return routeFallback
+    if (!force && !routeFallback && now - routeFallbackAt < 60_000) return null
+    routeFallbackAt = now
+    try {
+      const llm = getSvc('llm') || ctx.llm
+      if (!llm) return routeFallback
+      // ① DSH 本体当前选的模型
+      try {
+        const adm = getSvc('agentDefaultModel') || ctx.agentDefaultModel
+        const sel = adm?.currentSelection?.()
+        if (sel?.provider && sel?.model) {
+          routeFallback = { provider: sel.provider, model: sel.model }
+          log(`LLM 路由兜底：跟随 DSH 当前选择 ${sel.provider} / ${sel.model}`)
+          return routeFallback
+        }
+      } catch { /* ignore */ }
+      // ② 第一个已注册 provider 的第一个模型
+      const providers = (typeof llm.listProviders === 'function' ? llm.listProviders() : []) || []
+      for (const p of providers) {
+        const id = String(p?.id || '')
+        if (!id) continue
+        try {
+          const ms = await llm.listModels(id)
+          const m = (ms || []).find((x) => x?.id)
+          if (m) {
+            routeFallback = { provider: id, model: String(m.id) }
+            log(`LLM 路由兜底：DSH 没设默认模型，自动选用 ${id} / ${m.id}（想固定就到面板「人设模型」页指定）`)
+            return routeFallback
+          }
+        } catch { /* 这个 provider 取不到模型就换下一个 */ }
+      }
+    } catch { /* ignore */ }
+    return routeFallback
   }
 
   // ── 时间观念 ────────────────────────────────────────────────
@@ -4313,27 +4440,99 @@ ${cur.text}`
    * 联网搜索（DSH 的 web 服务，provider 由 DSH 配置决定）。
    * 返回给模型看的紧凑文本；失败返回空串（调用方会退化成"没搜到"）。
    */
-  async function doSearch(query) {
-    const web = (typeof ctx.get === 'function' ? ctx.get('web') : null) ?? ctx.web
-    if (!web?.search) { log('没有 web 搜索服务，跳过联网'); return '' }
+  /** 从一句中文里猜城市名（"今天石河子市的天气" → 石河子） */
+  function guessCityFromQuery(q) {
+    let s = String(q || '')
+    // 先剥掉"请问/帮我/查一下/今天"这类前缀，避免它们混进城市名
+    s = s.replace(/^(请问|帮我|帮忙|请|麻烦)?\s*(查一下|查查|查询|看看|看一下|搜一下|搜索)?\s*(今天|明天|现在|今日|当前)?\s*/, '')
+    const clean = (x) => String(x)
+      .replace(/^(今天|明天|现在|今日|当前)+/g, '')
+      .replace(/(今天|明天|现在|今日|当前)+$/g, '')
+      .trim()
+    // ① 优先认"XX市/县/区/旗"
+    const m1 = /([\u4e00-\u9fa5]{2,8})(?:市|县|区|旗)/.exec(s)
+    if (m1) { const c = clean(m1[1]); if (c.length >= 2) return c }
+    // ② 再认"XX天气/气温/温度/穿搭"
+    const m2 = /([\u4e00-\u9fa5]{2,8}?)(?:的)?(?:天气|气温|温度|穿搭|穿什么)/.exec(s)
+    if (m2) { const c = clean(m2[1]); if (c.length >= 2) return c }
+    return ''
+  }
+
+  /** Bing 网页兜底搜索（不需要任何 API key） */
+  async function searchViaBing(q) {
     try {
-      // 注意签名：search(request, signal) —— request 是对象，第二个参数才是 signal（早先传字符串+{} 会报 signal.addEventListener 不是函数）
-      const r = await web.search({ query: String(query), maxResults: 6 })
-      const srcs = Array.isArray(r?.sources) ? r.sources.slice(0, 6) : []
-      const lines = []
-      if (r?.answer) lines.push('摘要：' + String(r.answer).slice(0, 800))
-      for (const s of srcs) {
-        const t = String(s?.title || '').trim()
-        const u = String(s?.url || '').trim()
-        if (t || u) lines.push(`- ${t}${u ? '（' + u + '）' : ''}`)
+      const r = await fetch('https://www.bing.com/search?q=' + encodeURIComponent(q), {
+        headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36' },
+        signal: AbortSignal.timeout(12_000),
+      })
+      if (!r.ok) return ''
+      const html = await r.text()
+      const items = []
+      const re = /<li class="b_algo"[\s\S]*?<h2[^>]*>([\s\S]*?)<\/h2>([\s\S]*?)<\/li>/g
+      let m
+      while ((m = re.exec(html)) && items.length < 5) {
+        const clean = (s) => String(s).replace(/<[^>]+>/g, ' ')
+          .replace(/&amp;/g, '&').replace(/&nbsp;/g, ' ').replace(/&ensp;/g, ' ')
+          .replace(/&#0?183;/g, '·').replace(/&#176;/g, '°')
+          .replace(/&#\d+;/g, ' ').replace(/&[a-z]+;/gi, ' ')
+          .replace(/\s+/g, ' ').trim()
+        const title = clean(m[1])
+        const snippet = clean(m[2]).slice(0, 180)
+        if (title) items.push('- ' + title + (snippet ? '：' + snippet : ''))
       }
-      const out = lines.join('\n')
-      log(`联网搜索「${query}」→ ${srcs.length} 条结果` + (r?.answer ? '（含摘要）' : ''))
-      return out
+      if (!items.length) return ''
+      log(`Bing 兜底搜索「${q}」→ ${items.length} 条`)
+      return items.join('\n')
     } catch (e) {
-      log('联网搜索失败：' + String(e?.message || e))
+      log('Bing 兜底搜索失败：' + String(e?.message || e))
       return ''
     }
+  }
+
+  async function doSearch(query) {
+    const q = String(query || '')
+    // ① DSH 自带 web 搜索（可能因为后端 key 失效而失败 → 不能让整条链路跟着废）
+    const web = (typeof ctx.get === 'function' ? ctx.get('web') : null) ?? ctx.web
+    if (web?.search) {
+      try {
+        // 注意签名：search(request, signal) —— request 是对象，第二个参数才是 signal（早先传字符串+{} 会报 signal.addEventListener 不是函数）
+        const r = await web.search({ query: q, maxResults: 6 })
+        const srcs = Array.isArray(r?.sources) ? r.sources.slice(0, 6) : []
+        const lines = []
+        if (r?.answer) lines.push('摘要：' + String(r.answer).slice(0, 800))
+        for (const s of srcs) {
+          const t = String(s?.title || '').trim()
+          const u = String(s?.url || '').trim()
+          if (t || u) lines.push(`- ${t}${u ? '（' + u + '）' : ''}`)
+        }
+        const out = lines.join('\n')
+        if (out) {
+          log(`联网搜索「${q}」→ ${srcs.length} 条结果` + (r?.answer ? '（含摘要）' : ''))
+          return out
+        }
+        log(`联网搜索「${q}」返回空 → 走本地兜底`)
+      } catch (e) {
+        log('联网搜索失败：' + String(e?.message || e) + ' → 走本地兜底')
+      }
+    } else {
+      log('没有 web 搜索服务，走本地兜底')
+    }
+    // ② 天气类：直接用 open-meteo（免密钥、更准），不依赖任何搜索服务
+    if (/天气|气温|温度|下雨|降雨|降雪|风力|紫外线|穿什么|穿搭|weather/i.test(q)) {
+      try {
+        const city = guessCityFromQuery(q) || config.weatherCity || ''
+        if (city) {
+          const w = await fetchWeather({ city, timeoutMs: 15_000 })
+          if (w.ok) {
+            log(`天气兜底（open-meteo）「${q}」→ ${w.resolvedName || city}`)
+            return composeWeatherBrief(w.raw, { name: w.resolvedName || city })
+          }
+          log('天气兜底失败：' + w.error)
+        }
+      } catch (e) { log('天气兜底异常：' + String(e?.message || e)) }
+    }
+    // ③ 其他查询：Bing 网页兜底
+    return await searchViaBing(q)
   }
 
   /** 调一次 LLM，同时收集诊断信息（空回复时靠它定位原因） */
@@ -4359,7 +4558,7 @@ ${cur.text}`
     })()
   }
 
-  async function callLlm(route, systemText, userText, effort) {    const ac = new AbortController()
+  async function callLlm(route, systemText, userText, effort, maxTokens) {    const ac = new AbortController()
     const killer = track(setTimeout(() => ac.abort(new Error('LLM 超时')), 30_000))
     let text = ''
     const diag = { chunks: {}, finish: '', failure: null, reasoningChars: 0, blocks: 0, usage: null, err: '' }
@@ -4372,7 +4571,9 @@ ${cur.text}`
           content: [{ type: 'text', text: userText }],
         })],
         temperature: config.temperature,
-        maxTokens: config.maxTokens,
+        // ★ 定时任务可以单独放宽：推理型模型会把额度烧在思考上，800 token 常常烧完思考就没正文了
+        //   → 表现是"调用成功但返回空"，天气就退回原始数据发一堆符号圆点
+        maxTokens: Number(maxTokens) || config.maxTokens,
         signal: ac.signal,
       }
       if (effort) opts.reasoningEffort = effort
@@ -7414,6 +7615,46 @@ ${cur.text}`
     switch (op) {
       case 'status':
         return await client.call('status', {}, 8000)
+
+      // ── 定时任务（面板「⏰ 定时任务」页）────────────────────────────
+      // 时间计算/校验全在 lib/scheduler.mjs；这里只做转发 + 手动执行。
+      case 'schedule.list': {
+        const tasks = scheduler.list()
+        return { ok: true, tasks, log: scheduler.history(30), now: Date.now() }
+      }
+      case 'schedule.save': {
+        const input = a.task || a
+        const r = scheduler.upsert(input)
+        if (!r.ok) throw new Error(r.error || '保存失败')
+        log(`[定时] 已保存「${r.task.name}」→ ${describeWhenSafe(r.task.when)}`)
+        return { ok: true, task: r.task }
+      }
+      case 'schedule.remove': {
+        const r = scheduler.remove(String(a.id || ''))
+        if (!r.ok) throw new Error(r.error || '删除失败')
+        return { ok: true }
+      }
+      case 'schedule.toggle': {
+        const r = scheduler.setEnabled(String(a.id || ''), a.enabled !== false)
+        if (!r.ok) throw new Error(r.error || '切换失败')
+        return { ok: true, task: r.task }
+      }
+      case 'schedule.run': {
+        // 手动"立即执行"：真的会发到群里，且**不推进**下次时间（用户只是想预览效果）
+        const t = scheduler.get(String(a.id || ''))
+        if (!t) throw new Error('找不到这个任务：' + a.id)
+        const r = await runScheduleTask(t, { manual: true })
+        return { ok: !!r.ok, ...r }
+      }
+      case 'schedule.preview': {
+        const r = scheduler.preview(a.task || a)
+        if (!r.ok) throw new Error(r.error || '预览失败')
+        return { ok: true, ...r, atText: r.nextRunAt ? new Date(r.nextRunAt).toLocaleString() : '' }
+      }
+      case 'schedule.clearLog': {
+        scheduler.clearHistory?.()
+        return { ok: true }
+      }
       case 'postMoment': {
         // 手动发一条（面板「立即发一条」/ 指定文案两条路都走这里）
         const text = String(a.text || '').trim()
@@ -8438,7 +8679,7 @@ ${cur.text}`
 
   ctx.effect(() => safeRegister({
     name: 'wechat_bot_config',
-    description: '读取或实时修改微信机器人的拟人参数（无需重启）。key 留空 = 查看全部；给了 value = 修改。可改：enabled/dryRun/persona/replyProbability/minReplyGapMs/maxRepliesPer10Min/quietHours/stickerChance/splitChance/botName/rooms/temperature/voiceOnVoice/voiceSay/voiceSayProbability/voiceSayOnVoiceProbability/voiceSayMaxChars/healthAlert/healthAlertQuietMs/healthCheckMs/videoDeleteAfterRead/videoUpgradeDelayMs/videoFrames/linkVideo/linkVideoProbability/linkVideoMaxSeconds/linkVideoMaxMB/linkVideoCooldownMs/linkVideoTimeoutMs/linkVideoFrames。',
+    description: '读取或实时修改微信机器人的拟人参数（无需重启）。key 留空 = 查看全部；给了 value = 修改。可改：enabled/dryRun/persona/replyProbability/minReplyGapMs/maxRepliesPer10Min/quietHours/stickerChance/splitChance/botName/rooms/temperature/voiceOnVoice/voiceSay/voiceSayProbability/voiceSayOnVoiceProbability/voiceSayMaxChars/pythonPath/gptSovitsDir/healthAlert/healthAlertQuietMs/healthCheckMs/videoDeleteAfterRead/videoUpgradeDelayMs/videoFrames/linkVideo/linkVideoProbability/linkVideoMaxSeconds/linkVideoMaxMB/linkVideoCooldownMs/linkVideoTimeoutMs/linkVideoFrames/schedulerEnabled/schedulerCheckMs/schedulerCatchUpMs/schedulerRespectQuiet/weatherCity/schedulerDefaultRoom。',
     parameters: {
       type: 'object',
       properties: {
@@ -8680,6 +8921,334 @@ ${cur.text}`
     },
   }), SHORT + ': wechat_bot_history')
 
+  // ══════════════════════════════════════════════════════════════════════
+  //  定时任务（2026-10-30）：到点自动往群里发东西
+  //
+  //  用户要的三件事：① 每天播天气 ② 按时提醒打卡/签到 ③ 自己写任意提醒。
+  //
+  //  几条硬规矩（都是踩过的坑）：
+  //    · 任务单独存 schedules.json，不混进 config.json —— 一个任务写坏不能把整体配置拖死。
+  //    · "到点判定"全在 lib/scheduler.mjs（每日/每周/间隔/一次性/cron），这里只负责**执行**。
+  //    · 失败也要重排下一次（markRun 内部保证），否则失败任务会每 30 秒重试把宿主打满。
+  //    · 定时器和 DSH 共用事件循环：任何一步都不许抛出去。
+  // ══════════════════════════════════════════════════════════════════════
+  const scheduler = createScheduler({
+    file: join(dshHome, 'wechat-bot', 'schedules.json'),
+    log: (m) => log('[定时] ' + m),
+    catchUpMs: Number(config.schedulerCatchUpMs) || 6 * 3_600_000,
+  })
+
+  /** 定任务的落点群：任务指定 → 全局默认 → 最近活跃的群 → 唯一群。 */
+  async function resolveScheduleRoom(task) {
+    const key = String(task?.target?.room || config.schedulerDefaultRoom || '').trim()
+    try {
+      return await resolveRoom(key)
+    } catch (e) {
+      if (key) throw e
+      // 没指定群、又不止一个群：挑最近活跃的那个（"我常聊的群"通常是用户想要的）
+      let best = null
+      for (const r of rooms.values()) {
+        if (!best || (r.lastActivityAt || 0) > (best.lastActivityAt || 0)) best = r
+      }
+      if (best) return { roomId: best.roomId, name: best.roomName }
+      throw e
+    }
+  }
+
+  /** AI 写不出内容时的统一说明：把最可能的根因直接说给用户听。 */
+  function llmFailNote() {
+    let routeOk = false
+    try { routeOk = !!resolveRoute() } catch { routeOk = false }
+    return routeOk
+      ? 'AI 这次没写出内容（模型返回空）。看插件日志确认；也可以把动作改成「固定文案」先顶上'
+      : 'AI 写不出内容：LLM 路由没确定 —— 去面板「人设模型」页指定 provider/model（或在 DSH 里选一个默认模型）'
+  }
+
+  /** 用机器人的语气写一句话（"让 AI 现写" / 天气润色 / 联网播报都走它）。失败返回 ''，由调用方兜底。 */
+  async function scheduleLlmLine(sysExtra, userText) {
+    const user = String(userText || '').trim()
+    if (!user) return ''
+    const sys = `你在微信群里扮演「${config.botName}」。${config.persona}\n`
+      + `现在：${nowInfo().dateLine}\n`
+      + '要求：只输出要发的那条消息本身，短、口语、像群友；不要引号、不要解释、不要加"机器人"之类的前缀。'
+      + (sysExtra ? '\n' + sysExtra : '')
+    const effort = config.reasoningEffort || undefined
+    let { text, diag } = await scheduleLlmCallOnce(sys, user, effort)
+    // ★ 模型返回空 ≠ 调用失败：多半是① 适配器不吃 system 槽 ② reasoningEffort 不支持
+    //   （以前这两种都只返回空 → 天气退回原始数据发一堆符号.""小圆点""，用户以为是功能是坏的）
+    if (!text) {
+      const badEffort = /REASONING_EFFORT/.test(String(diag?.failure?.code || '') + String(diag?.err || ''))
+      log(`[定时] AI 返回空（${fmtDiag(diag)}）→ 降级重试${badEffort ? '（去掉 reasoningEffort）' : ''}`)
+      const r2 = await scheduleLlmCallOnce('', sys + '\n\n' + user, badEffort ? undefined : effort)
+      text = r2.text
+      if (!text && !badEffort && effort) {
+        // 再退一档：连 reasoningEffort 也不传（有些模型给了会只思考不输出）
+        const r3 = await scheduleLlmCallOnce('', sys + '\n\n' + user, undefined)
+        text = r3.text
+      }
+      if (!text) log('[定时] 两次重试都为空 → 退回原始数据')
+    }
+    return text
+  }
+
+  /**
+   * 单次 LLM 调用。返回 { text, diag }，**永不抛异常**（在定时器里跑）。
+   * failure 信息带出来，让上层能判断要不要降级重试。
+   */
+  async function scheduleLlmCallOnce(sysText, userText, effort) {
+    try {
+      const route = resolveRoute()
+      const { text, diag } = await callLlm(route, sysText, String(userText || ''), effort, 2000)
+      return { text: String(text || '').trim().replace(/^["'「『]|["'」』]$/g, ''), diag }
+    } catch (e) {
+      return { text: '', diag: { err: String(e?.message || e) } }
+    }
+  }
+
+  /** 把任务变成一条要发的文本。返回 { text, note }；text 为空 = 这次不值得发。 */
+  async function buildScheduleText(task) {
+    const a = task?.action || {}
+    if (a.kind === 'text') return { text: String(a.text || '').trim() }
+    if (a.kind === 'llm') {
+      const t = await scheduleLlmLine('', a.prompt)
+      // ★ 以前这里直接返回空 → 面板只显示"内容为空，跳过"，用户根本不知道是模型没配好
+      return t ? { text: t } : { text: '', note: llmFailNote() }
+    }
+    if (a.kind === 'search') {
+      const info = await doSearch(String(a.query || ''))
+      if (!info) return { text: '', note: '联网没查到内容' }
+      if (a.polish === false) return { text: info }
+      const srchBase = [
+        '下面是**联网查到的资料**，用你自己的话挑重点说，别罗列链接。',
+        '硬要求：只说资料里有的信息，缺了就说不知道，不要编。',
+      ].join('\n')
+      const hint2 = a.hint ? ('\n用户额外要求：' + a.hint) : ''
+      const t = await scheduleLlmLine(srchBase + hint2, info)
+      return { text: t || info }
+    }
+    if (a.kind === 'weather') {
+      const city = String(a.city || config.weatherCity || '').trim()
+      if (!city) return { text: '', note: '没配置城市（config.weatherCity 或任务里填城市）' }
+      const w = await fetchWeather({ city, timeoutMs: 15_000 })
+      if (!w.ok) return { text: '', note: '天气取不到：' + w.error }
+      // ★ 2026-10-30：用户要的是「天气 + 运势 + 穿搭」三块。以前三块全指望 AI 润色，
+      //   模型一返回空就只剩天气（真实事故）。现在先用**本地规则**把三块拼齐
+      //   （天气=真实数据，穿搭=温度/温差/降水/风/紫外线规则，运势=按日期确定性生成），
+      //   AI 只负责"改语气"这件锦上添花的事；它挂了也照样三块齐全。
+      const full = composeWeatherBrief(w.raw, { name: w.resolvedName || city })
+      const body = full || w.text
+      if (a.polish === false) return { text: body, note: 'weather' }
+      const base = [
+        '下面是**已经写好的天气简报**：天气数据是真的，穿搭和运势也已经算好。',
+        '请用你的语气说得自然一点（像在群里跟朋友唠嗑），但必须遵守：',
+        '① 温度、风力、湿度、紫外线等数字**照抄**，不要改也不要漏；',
+        '② 穿搭和运势**两块都要保留**，但不要加"娱乐向""别当真"这类免责提醒；',
+        '③ 数据里没有的信息不许编，也不许写"查不到/不确定"；',
+        '④ 不要用"以下是""根据数据"这类腔调。',
+      ].join('\n')
+      const t = await scheduleLlmLine(base + (a.hint ? '\n用户额外要求：' + a.hint : ''), body)
+      // 润色失败就发本地版 —— 绝不退回"只有天气"的原始文本
+      return { text: t || body, note: t ? 'weather' : 'weather（AI 没写出，发的是本地拼好的完整版）' }
+    }
+    return { text: '', note: '未知动作类型：' + String(a.kind || '') }
+  }
+
+  /** 执行一条任务：拼内容 → 找群 → 发出去。全程不抛异常（定时器里跑的）。 */
+  async function runScheduleTask(task, { manual = false } = {}) {
+    try {
+      const { text, note } = await buildScheduleText(task)
+      if (!text) {
+        const err = note || '内容为空，跳过'
+        log(`[定时] 「${task.name}」没发：${err}`)
+        if (!manual) scheduler.markRun(task.id, { ok: false, error: err })
+        return { ok: false, error: err }
+      }
+      const room = await resolveScheduleRoom(task)
+      const r = roomState(room.roomId, room.name)
+      let body = text
+      const atName = String(task?.target?.at || '').trim()
+      if (atName && config.allowAt !== false) body = `@${atName} ${body}`
+      if (config.allowAt !== false && body.includes('@')) await ensureAtIndex(r)
+      const mm = resolveMentions(r, body)
+      if (config.dryRun) {
+        log(`[定时] 演练模式不真发：「${task.name}」→ ${mm.text.slice(0, 80)}`)
+        if (!manual) scheduler.markRun(task.id, { ok: true, preview: mm.text })
+        return { ok: true, preview: mm.text, dryRun: true }
+      }
+      const sent = await client.call('sendText', {
+        roomId: room.roomId, text: mm.text,
+        ...(mm.mentions.length ? { mentions: mm.mentions } : {}),
+      }, 20_000)
+      const rc = (sent && typeof sent === 'object') ? (sent.rc ?? JSON.stringify(sent)) : sent
+      stats.sentText++
+      push(r, { ts: Date.now(), isSelf: true, sender: 'self', senderName: '我', text: mm.text })
+      let extra = ''
+      if (task?.target?.sticker) {
+        try {
+          const picked = await client.call('pickSticker', { text: mm.text, roomId: room.roomId, minScore: 0 }, 10_000)
+          if (picked?.id) {
+            await client.call('sendSticker', { roomId: room.roomId, stickerId: picked.id }, 15_000)
+            stats.sentSticker++
+            extra = '（附表情包）'
+          }
+        } catch { /* 表情包没发出去不影响正文 */ }
+      }
+      const ok = rc === 0 || rc === '0' || rc === undefined || rc === null
+      log(`[定时] 「${task.name}」已发到「${room.name}」${extra}｜rc=${rc}`)
+      if (!manual) scheduler.markRun(task.id, { ok, preview: mm.text, error: ok ? '' : ('rc=' + rc) })
+      return { ok, preview: mm.text, rc, room: room.name }
+    } catch (e) {
+      const err = String(e?.message || e).slice(0, 200)
+      log(`[定时] 「${task.name}」失败：${err}`)
+      if (!manual) scheduler.markRun(task.id, { ok: false, error: err })
+      return { ok: false, error: err }
+    }
+  }
+
+  /** 到点巡检：串行跑，避免同一分钟 N 个任务一起把 hook 打爆。 */
+  let scheduleRunning = false
+  async function scheduleTick() {
+    if (!config.schedulerEnabled || scheduleRunning) return
+    scheduleRunning = true
+    try {
+      for (const t of scheduler.due()) {
+        try {
+          // 用户自己定的提醒默认 ignoreQuiet=true（睡觉也照发）；这里只管勾了"遵守作息"的那些
+          if (config.schedulerRespectQuiet && !t.ignoreQuiet && isQuiet(quietWindows)) {
+            scheduler.markRun(t.id, { ok: false, error: '安静时段，已跳过' })
+            continue
+          }
+          await runScheduleTask(t)
+        } catch { /* runScheduleTask 已兜底，这里再兜一层：绝不让异常冒到定时器外 */ }
+      }
+    } catch (e) {
+      log('[定时] 巡检异常：' + String(e?.message || e).slice(0, 160))
+    } finally {
+      scheduleRunning = false
+    }
+  }
+
+  ctx.effect(() => {
+    const every = Math.max(5_000, Number(config.schedulerCheckMs) || 30_000)
+    const iv = setInterval(() => { void scheduleTick() }, every)
+    return () => clearInterval(iv)
+  }, SHORT + ': scheduler tick')
+
+  // 启动 8 秒后先巡检一次：开机时刚好跨过点（比如 09:30 整开机）也能补上
+  track(setTimeout(() => { void scheduleTick() }, 8000))
+  try {
+    const s = scheduler.list()
+    const on = s.filter((x) => x.enabled).length
+    log(`定时任务：共 ${s.length} 条（启用 ${on}）｜调度器${config.schedulerEnabled ? '开' : '关'}｜检查间隔 ${Math.round((Number(config.schedulerCheckMs) || 30_000) / 1000)}s`)
+  } catch { /* ignore */ }
+
+  // 定时任务也能在对话里管（"帮我加个每天 9:30 播天气"），面板里改更直观。
+  ctx.effect(() => safeRegister({
+    name: 'wechat_bot_schedule',
+    description: '管理微信机器人的定时任务（到点自动往群里发消息）。op：list=列出全部（含下次运行时间）｜add=新增｜remove=删除｜toggle=启停｜run=立即执行一次（真发）。'
+      + '时间（kind）：daily 每天，需 time="09:30"；weekly 每周，需 time + weekdays="1,3,5"（1=周一…7=周日）；'
+      + 'interval 每隔，需 everyMinutes=60；once 只跑一次，需 at="2026-11-01T09:00"；cron 需 expr="0 9 * * *"。'
+      + '动作（action）：text 固定文案（text=…）｜llm 让机器人自己写（prompt=…）｜weather 查天气（city=城市，默认取 weatherCity）｜search 联网查（query=…）。'
+      + '目标：room=群名或 roomId（留空=默认群）、atName=@某人（可选）、sticker=true 附一张表情包。',
+    parameters: {
+      type: 'object',
+      properties: {
+        op: { type: 'string', description: 'list / add / remove / toggle / run' },
+        id: { type: 'string', description: 'remove/toggle/run 要操作的任务 id' },
+        name: { type: 'string', description: '任务名（add 时用；不填会自动起一个）' },
+        kind: { type: 'string', description: 'daily / weekly / interval / once / cron' },
+        time: { type: 'string', description: 'HH:MM，daily/weekly 用' },
+        weekdays: { type: 'string', description: '逗号分隔，1=周一…7=周日' },
+        everyMinutes: { type: 'number', description: '每隔多少分钟' },
+        at: { type: 'string', description: 'YYYY-MM-DDTHH:MM，once 用' },
+        expr: { type: 'string', description: 'cron 五段表达式，如 0 9 * * *' },
+        action: { type: 'string', description: 'text / llm / weather / search' },
+        text: { type: 'string', description: '固定文案（action=text）' },
+        prompt: { type: 'string', description: '让 AI 现写的提示词（action=llm）' },
+        city: { type: 'string', description: '城市（action=weather）' },
+        query: { type: 'string', description: '联网查询词（action=search）' },
+        room: { type: 'string', description: '群名或 roomId，留空=默认群' },
+        atName: { type: 'string', description: '要 @ 的昵称（可选）' },
+        sticker: { type: 'boolean', description: 'true = 发完附一张表情包' },
+        enabled: { type: 'boolean', description: 'toggle 时的目标状态；add 时是否启用（默认 true）' },
+      },
+      required: ['op'],
+    },
+    output: textOut,
+    async execute(args) {
+      const op = String(args?.op || 'list').trim().toLowerCase()
+      const whenText = (t) => {
+        const d = t.nextRunAt ? new Date(t.nextRunAt).toLocaleString() : '（不再运行）'
+        return `${describeWhenSafe(t.when)}｜下次 ${d}`
+      }
+      if (op === 'list') {
+        const tasks = scheduler.list()
+        if (!tasks.length) return '还没有定时任务。用 wechat_bot_schedule add 加一条，或去面板「⏰ 定时任务」页加。'
+        const lines = [`定时任务 ${tasks.length} 条（调度器${config.schedulerEnabled ? '开' : '关'}）：`]
+        for (const t of tasks) {
+          lines.push(`- [${t.enabled ? '开' : '关'}] ${t.name}（id=${t.id}）`)
+          lines.push(`    ${whenText(t)}｜动作 ${t.action.kind}｜群 ${t.target.room || '默认'}｜跑过 ${t.runCount} 次${t.lastOk === false ? '｜上次失败：' + String(t.lastError).slice(0, 60) : ''}`)
+        }
+        return lines.join('\n')
+      }
+      if (op === 'remove' || op === 'toggle' || op === 'run') {
+        const id = String(args?.id || '').trim()
+        const t = scheduler.get(id)
+        if (!t) {
+          const all = scheduler.list()
+          if (all.length === 1 && !id) { /* 只有一个任务时允许不传 id */ }
+          else return `找不到任务 ${id}。现有 id：${all.map((x) => x.id + '（' + x.name + '）').join('，') || '（无）'}`
+        }
+        if (op === 'remove') {
+          const r = scheduler.remove(t ? id : scheduler.list()[0].id)
+          return r.ok ? '已删除。' : ('删除失败：' + r.error)
+        }
+        if (op === 'toggle') {
+          const r = scheduler.setEnabled(t ? id : scheduler.list()[0].id, args?.enabled !== false)
+          return r.ok ? `已${r.task.enabled ? '启用' : '停用'}「${r.task.name}」｜${whenText(r.task)}` : ('切换失败：' + r.error)
+        }
+        const target = t || scheduler.list()[0]
+        const r = await runScheduleTask(target, { manual: true })
+        return r.ok ? `已立即执行「${target.name}」→ 发到${r.room ? '「' + r.room + '」' : '默认群'}：${String(r.preview || '').slice(0, 120)}`
+          : `执行失败：${r.error}`
+      }
+      if (op === 'add') {
+        const kind = String(args?.kind || 'daily').trim().toLowerCase()
+        const action = String(args?.action || 'text').trim().toLowerCase()
+        const when = { kind }
+        if (args?.time) when.time = String(args.time)
+        if (args?.weekdays) when.weekdays = String(args.weekdays).split(/[,，\s]+/).map((s) => Number(s)).filter((n) => n >= 1 && n <= 7)
+        if (args?.everyMinutes) when.everyMinutes = Number(args.everyMinutes)
+        if (args?.at) when.at = String(args.at)
+        if (args?.expr) when.expr = String(args.expr)
+        const act = { kind: action }
+        if (args?.text) act.text = String(args.text)
+        if (args?.prompt) act.prompt = String(args.prompt)
+        if (args?.city) act.city = String(args.city)
+        if (args?.query) act.query = String(args.query)
+        const task = {
+          name: String(args?.name || '').trim(),
+          enabled: args?.enabled !== false,
+          when, action: act,
+          target: { room: String(args?.room || '').trim(), at: String(args?.atName || '').trim(), sticker: !!args?.sticker },
+          ignoreQuiet: true,
+        }
+        const r = scheduler.upsert(task)
+        if (!r.ok) return '没加上：' + r.error
+        return `已加定时任务「${r.task.name}」（id=${r.task.id}）\n${whenText(r.task)}\n面板「⏰ 定时任务」页可以随时改。`
+      }
+      return 'op 只能是 list / add / remove / toggle / run'
+    },
+  }), SHORT + ': wechat_bot_schedule')
+
+  // LLM 路由兜底：启动 12 秒后探一次，之后每 10 分钟复查
+  // （用户随时可能在 DSH 里选了默认模型；探到了定时任务「AI 现写」这类功能才有得用）
+  track(setTimeout(() => { void refreshRouteFallback(true) }, 12_000))
+  ctx.effect(() => {
+    const iv = setInterval(() => { void refreshRouteFallback() }, 600_000)
+    return () => clearInterval(iv)
+  }, SHORT + ': route fallback')
+
   // ── Web 控制面板（挂在 DSH 已有 webServer 的 /wechat-bot）──────────────
   // 没有 webServer 的环境（纯 CLI / 别的 profile）会自动跳过，不影响机器人本体。
   // 用带 ?t= 的动态 import：Node 的 ESM 缓存不会因为 dev_reload_package 清掉子模块，
@@ -8724,6 +9293,9 @@ ${cur.text}`
     logFile,
     // 桥日志目录（本机固定在工作区；可用环境变量覆盖）
     bridgeLogDir: process.env.WECHAT_BRIDGE_LOG_DIR || 'D:\\微信deepseek\\data\\logs',
+    // 定时任务：面板 /state 里直接带上，打开页面就有数据（不用再多一次往返）
+    schedules: () => { try { return scheduler.list() } catch { return [] } },
+    scheduleLog: () => { try { return scheduler.history(30) } catch { return [] } },
   }
   void (async () => {
     try {

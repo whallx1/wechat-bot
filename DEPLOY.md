@@ -130,7 +130,7 @@ notepad config.json
   "apiPort": 30001,                                 // Hook 的 HTTP 端口
   "cbPort": 18998,                                  // 回调端口（本版 Hook 用不到，但保留兼容）
   "bridgePort": 17300,                              // 接入层端口
-  "pythonExe": "python",                            // 或写绝对路径
+  "pythonExe": "python",                            // 兼容别名（仍生效），等价于 pythonPath；建议改用 PYTHON_EXE 或 pythonPath
   "dataDir": "./data",
   "hosted": {
     "enabled": false,                               // 用外部 agent 时才开

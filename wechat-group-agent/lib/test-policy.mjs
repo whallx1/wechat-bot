@@ -49,7 +49,8 @@ ok(humanDelayMs('嗯', 'ambient', 0.99) > humanDelayMs('嗯', 'ambient', 0.3), '
 // ── 拆句 ───────────────────────────────────────────────────
 ok(splitMessage('就这样吧', { chance: 0.15, rand: 0.9 }).length === 1, '未命中概率不拆句')
 const sp = splitMessage('今天真累啊。先睡了。明天再聊', { chance: 0.15, rand: 0.0 })
-ok(sp.length === 2, `命中概率拆成两条（${sp.length}）`)
+ok(sp.length === 3, `命中概率按三句拆分（默认 maxParts=3，实际 ${sp.length}）`)
+ok(splitMessage('今天真累啊。先睡了。明天再聊', { chance: 0.15, rand: 0, maxParts: 2 }).length === 2, '显式 maxParts=2 时尾句合并为两条')
 ok(splitMessage('嗯。', { chance: 1, rand: 0 }).length === 1, '太短不拆')
 ok(gapMs(0.5) > 700 && gapMs(0.5) < 2100, '两条之间的间隔合理')
 

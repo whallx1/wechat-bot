@@ -17,11 +17,13 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, unl
 import { dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { paths as imagePaths, md5 } from './wechat-image.mjs'   // 临时目录/数据根沿用图片那套
+import { resolvePythonExe, pythonHint } from './python-runtime.mjs'
 
 const TMP_DIR = imagePaths.TMP_DIR
 const HERE = dirname(fileURLToPath(import.meta.url))
 const BRIDGE_DIR = join(HERE, '..')
-const PY = process.env.PYTHON_EXE || 'D:\\Python311\\python.exe'
+function pyExe() { return resolvePythonExe() }
+const PY = resolvePythonExe() || ''   // 仅用于 paths 展示（解析不到就是空串）
 const SCRIPT = join(BRIDGE_DIR, 'video-probe.py')
 const VIDEO_TMP = join(TMP_DIR, 'video')          // 抽帧/联系表/音轨都放这里
 const PY_ENV = { ...process.env, PYTHONIOENCODING: 'utf-8' }
@@ -292,6 +294,8 @@ export function pruneVideoTemp(maxAgeMs = 60 * 60_000) {
 export function probeVideo(videoPath, { frames = 6, fps = 1, tag = 'video', log = () => {} } = {}) {
   if (!existsSync(SCRIPT)) { log(`视频抽帧：脚本不存在（${SCRIPT}）`); return null }
   if (!existsSync(videoPath)) { log(`视频抽帧：源文件不存在（${videoPath}）`); return null }
+  const py = pyExe()
+  if (!py) { log(`视频抽帧：没找到可用的 Python（${pythonHint()}）`); return null }
   try {
     mkdirSync(VIDEO_TMP, { recursive: true })
     const n = pruneVideoTemp()
@@ -301,7 +305,7 @@ export function probeVideo(videoPath, { frames = 6, fps = 1, tag = 'video', log 
   try {
     // ★ 2026-10-28：加 --fps（每秒抽几帧，默认 1）。脚本会按时长 × fps 决定帧数，
     //   每 20 帧拼一张联系表 → 长视频会产出多张（之前调用方只用了第一张，等于只看到前 20 秒）。
-    const out = execFileSync(PY, [SCRIPT, '--in', videoPath, '--out-dir', VIDEO_TMP,
+    const out = execFileSync(py, [SCRIPT, '--in', videoPath, '--out-dir', VIDEO_TMP,
       '--frames', String(Number(frames) || 6),
       '--fps', String(Number(fps) > 0 ? Number(fps) : 1),
       '--tag', safe],

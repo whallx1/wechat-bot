@@ -23,6 +23,7 @@ import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, unlinkSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { resolvePythonExe, pythonHint } from './python-runtime.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const BRIDGE_DIR = join(HERE, '..')
@@ -35,8 +36,8 @@ const PY_ENV = { ...process.env, PYTHONIOENCODING: 'utf-8' }
  * 为什么不做成 import 时的常量（video/voice 那两个模块是常量）：常量会把"import 之后再改
  * 环境变量"变成静默无效（实测踩到：测试里改 PYTHON_EXE 完全没生效，还以为护栏坏了）。
  */
-function pyExe() { return process.env.PYTHON_EXE || 'D:\\Python311\\python.exe' }
-const PY = pyExe()   // 仅用于 paths 展示
+function pyExe() { return resolvePythonExe() }
+const PY = resolvePythonExe() || ''   // 仅用于 paths 展示（解析不到就是空串，别再给个假路径）
 
 /**
  * 音色预设（**用户已选定，别改数值**）。
@@ -146,7 +147,7 @@ export function synthesizeVoice(text, { emotion = 'main', voice, rate, pitch, ve
 
   if (!existsSync(SCRIPT)) { log(`TTS：脚本不存在（${SCRIPT}）`); return null }
   const py = pyExe()
-  if (!existsSync(py)) { log(`TTS：Python 不存在（${py}，可用 PYTHON_EXE 覆盖）`); return null }
+  if (!py) { log(`TTS：没找到可用的 Python（${pythonHint()}）`); return null }
 
   let out = ''
   try {

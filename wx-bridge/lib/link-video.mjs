@@ -22,11 +22,15 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, wri
 import { dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { probeVideo } from './wechat-video.mjs'
+// Python 解释器统一交给 python-runtime（环境变量 → 配置 pythonPath → 自动探测 → null）
+import { resolvePythonExe } from './python-runtime.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const BRIDGE_DIR = join(HERE, '..')
 const LINK_TMP = join(BRIDGE_DIR, '..', 'data', 'link-video')   // 与 wechat-image.mjs 的 data/ 同级
-const PY = process.env.PYTHON_EXE || 'D:\\Python311\\python.exe'
+/** 每次调用时才解析（内部有缓存）：运行期改了 PYTHON_EXE / 配置也能生效 */
+function pyExe() { return resolvePythonExe() }
+const PY = resolvePythonExe() || ''   // 仅用于 paths 展示（解析不到就是空串）
 const PY_ENV = { ...process.env, PYTHONIOENCODING: 'utf-8' }
 
 export const paths = { LINK_TMP, PY }
@@ -171,8 +175,10 @@ export function ffmpegExe() {
     const v = process.env[k]
     if (v && existsSync(v)) { ffmpegPath = v; return ffmpegPath }
   }
+  const py = pyExe()
+  if (!py) return ffmpegPath          // 没有 Python → 拿不到 imageio 的 ffmpeg，交给 yt-dlp 自己找 PATH
   try {
-    const out = execFileSync(PY, ['-c', 'import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())'],
+    const out = execFileSync(py, ['-c', 'import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())'],
       { windowsHide: true, encoding: 'utf8', timeout: 30_000, env: PY_ENV })
     const p = String(out || '').trim().split(/\r?\n/).filter(Boolean).pop() || ''
     if (p && existsSync(p)) ffmpegPath = p
@@ -289,6 +295,14 @@ export function fetchLinkVideo(url, {
     }
 
     const ff = ffmpegExe()
+    // yt-dlp 通过 Python 模块运行；解释器不存在时直接降级，避免 ENOENT error 事件。
+    const py = pyExe()
+    if (!py) {
+      log(`${tag}：没找到可用的 Python，跳过这次链接视频下载（可用 PYTHON_EXE 指定）`)
+      void removeLinkVideoDir(tmpDir)
+      resolve(null)
+      return
+    }
     const args = [
       '-m', 'yt_dlp',
       '-f', 'bv*+ba/b',
@@ -312,7 +326,7 @@ export function fetchLinkVideo(url, {
     log(`${tag}：${siteLabel(site)} 链接开始下载（上限 ${maxSeconds}s / ${maxMB}MB / ${Math.round(timeoutMs / 1000)}s 超时`
       + `${ff ? '' : '；⚠️ 没拿到 ffmpeg 路径'}${cookies && existsSync(cookies) ? '；带 cookies' : ''}）：${target}`)
 
-    execFile(PY, args, {
+    execFile(py, args, {
       // 下限 1s（只为拦住"0/负数"这种误传；正常调用是 120s）
       timeout: Math.max(1_000, Number(timeoutMs) || 120_000),
       killSignal: 'SIGKILL',

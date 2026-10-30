@@ -42,7 +42,11 @@ export class WxhelperBridge {
     this.stickers = opts.stickers || null
     this.dataDir = opts.dataDir || process.cwd()
     this.dllPath = opts.dllPath || 'D:\\wxhook\\wxhook.dll'
-    this.pythonExe = opts.pythonExe || 'D:\\Python311\\python.exe'
+    // ★ 2026-10-28：这里原先有个 this.pythonExe（**桥构造器的入参**，还写死了 D:\Python311\python.exe），
+    //   但**全仓零读取点**（注入那一步在 inject.mjs 里做，不走 Python）→ 已删除这个死字段。
+    //   ⚠️ 别把这件事和 config.json 顶层的 pythonExe 搞混：那个是 pythonPath 的**兼容别名、仍在生效**
+    //      （见 lib/python-runtime.mjs 的 CONFIG_KEYS），本文件删的只是桥自己的一个没人用的属性。
+    //   以后真要在本模块调 Python，请统一用 python-runtime 的解析器，别再写死路径。
     this.injector = opts.injector || 'D:\\wxhook\\inject_ctypes.py'
     this.wechatExe = opts.wechatExe || 'D:\\wxhook\\weixin-run\\Weixin.exe'
     this.log = opts.log || (() => {})

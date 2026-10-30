@@ -17,10 +17,12 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync 
 import { createHash } from 'node:crypto'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { resolvePythonExe } from './python-runtime.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const BRIDGE_DIR = join(HERE, '..')
-const PY = process.env.PYTHON_EXE || 'D:\\Python311\\python.exe'
+function pyExe() { return resolvePythonExe() }
+const PY = resolvePythonExe() || ''   // 仅用于 paths 展示
 const SCRIPT = join(BRIDGE_DIR, 'decode-wechat-image.py')
 const KEY_CACHE = join(BRIDGE_DIR, '..', 'data', 'wechat-image-key.json')
 const TMP_DIR = join(BRIDGE_DIR, '..', 'data', 'wechat-image-tmp')
@@ -228,11 +230,13 @@ export function findDatCandidates(root, roomId, { maxAgeMs = 30 * 60_000, nearTs
  */
 export function decryptDat(srcPath, { tag = 'img' } = {}) {
   if (!existsSync(SCRIPT)) return null
+  const py = pyExe()
+  if (!py) return null
   mkdirSync(TMP_DIR, { recursive: true })
   const dst = join(TMP_DIR, `${tag}-${Date.now()}.jpg`)
   let stdout = ''
   try {
-    stdout = execFileSync(PY, [SCRIPT, srcPath, dst], { windowsHide: true, timeout: 90_000, encoding: 'utf8' }) || ''
+    stdout = execFileSync(py, [SCRIPT, srcPath, dst], { windowsHide: true, timeout: 90_000, encoding: 'utf8' }) || ''
   } catch (e) {
     stdout = String(e?.stdout || '')
   }
@@ -260,8 +264,10 @@ export function hasKey() {
 
 /** 主动扫一次内存找密钥（需要客户端最近解密过图片） */
 export function scanKey() {
+  const py = pyExe()
+  if (!py) return false
   try {
-    const out = execFileSync(PY, [SCRIPT, '--find-key'], { windowsHide: true, timeout: 300_000, encoding: 'utf8' })
+    const out = execFileSync(py, [SCRIPT, '--find-key'], { windowsHide: true, timeout: 300_000, encoding: 'utf8' })
     return /结果:\s*([0-9a-zA-Z]{16})/.test(out) || /★ 找到 AES 密钥/.test(out)
   } catch {
     return false

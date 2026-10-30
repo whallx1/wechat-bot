@@ -309,6 +309,7 @@ const NAV = [
   {id:'inner', title:'内心', icon:'💭', groups:['persona'], special:'inner'},   // ★ 性格：心情/好恶/目标/日记/自传
   {id:'identity', title:'群与人', icon:'👥', groups:['identity'], special:'members'},
   {id:'moment', title:'朋友圈', icon:'📸', groups:['moment'], special:'moment'},
+  {id:'schedule', title:'定时任务', icon:'⏰', special:'schedule'},
   {id:'model', title:'人设模型', icon:'🐟', groups:['model'], special:'model'},
   {id:'diag', title:'诊断', icon:'🔬', special:'diag'},
   {id:'update', title:'更新', icon:'📦', special:'update'},
@@ -510,6 +511,7 @@ function renderActive(opts) {
   if (nav.id === 'features') return renderFeatures();
   if (nav.id === 'manual') return renderManual();
   if (nav.id === 'inner') return renderInner();
+  if (nav.id === 'schedule') return renderSchedule();
   if (nav.id === 'diag') return renderDiag();
   if (nav.id === 'update') return renderUpdate();
   if (nav.groups) {
@@ -2666,6 +2668,417 @@ function renderManual() {
       $('#q-result').innerHTML = Array.isArray(items) && items.length ? items.map(it => `<div style="padding:3px 0"><span class="muted small">${esc(fmtTime(it.ts))}</span> <b>${esc(it.isSelf?'我':(it.senderName||it.sender||''))}</b> ${esc(it.text)}</div>`).join('') : '<div class="empty">没有记录</div>';
     } catch (e) { toast(e.message, 'err'); }
   };
+}
+
+/* ── 定时任务（到点自动发到群里）─────────────────────────
+   数据：App.S.schedules（任务数组）+ App.S.scheduleLog（运行日志，新→旧），都由 lib 侧注入 /state。
+   改完之后一律 refresh() 重拉状态，不在前端自己改 App.S。 */
+const SCH_ACTION_TEXT = { weather:'查天气', text:'固定文案', llm:'AI 现写', search:'联网查' };
+const SCH_WD = [['1','一'],['2','二'],['3','三'],['4','四'],['5','五'],['6','六'],['7','日']];
+
+/** 时间/动作片段 → 一行人话，列表里「时间」「动作」两列显示用。 */
+function schWhenText(t) {
+  const w = (t && t.when) || {};
+  if (t && t.nextAtText) return String(t.nextAtText);
+  if (w.kind === 'daily') return '每天 ' + (w.time || '?');
+  if (w.kind === 'weekly') return '每周 ' + ((w.weekdays || []).map(d => '日一二三四五六'[Number(d) % 7]).join('')) + ' ' + (w.time || '?');
+  if (w.kind === 'interval') return '每 ' + (w.everyMinutes || '?') + ' 分钟';
+  if (w.kind === 'once') return '一次 ' + (w.at ? fmtTime(w.at) : '?');
+  if (w.kind === 'cron') return 'Cron ' + (w.cron || '?');
+  return '—';
+}
+function schRoomText(t) {
+  const room = (t && t.target && t.target.room) || '';
+  if (!room) return '默认群';
+  const hit = ((App.S.rooms || []).find(r => r.roomId === room) || (App.bridgeRooms || []).find(r => r.roomId === room));
+  return hit ? (hit.roomName || hit.name || room) : room;
+}
+/** datetime-local 的取值是本地时间字符串，转成毫秒时间戳给后端。 */
+function schLocalMs(v) {
+  if (!v) return 0;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? 0 : d.getTime();
+}
+
+function renderSchedule() {
+  const S = App.S || {};
+  const cfg = S.config || {};
+  // 数据源：优先用 /state 带的 schedules / scheduleLog；
+  // lib 还没注入时用 op schedule.list 拉回来的兜底结果。
+  const fb = App.scheduleFallback || null;
+  const tasks = Array.isArray(S.schedules) ? S.schedules : ((fb && fb.tasks) || []);
+  const log = Array.isArray(S.scheduleLog) ? S.scheduleLog : ((fb && fb.log) || []);
+  const serverTime = S.at ? new Date(S.at).toLocaleString() : '—';
+  if (App.scheduleEditId === undefined) App.scheduleEditId = null;
+
+  // ── 任务行 ────────────────────────────────────────────
+  const taskRows = tasks.length ? tasks.map(t => {
+    const nextAt = Number(t.nextRunAt) || 0;
+    const mark = t.lastOk === true ? '✅' : (t.lastOk === false ? '❌' : '—');
+    const errTitle = (t.lastOk === false && t.lastError) ? ' title="' + esc(String(t.lastError).slice(0, 40)) + '"' : '';
+    return `<tr>
+      <td><b>${esc(t.name || '(未命名)')}</b> ${t.enabled === false ? '<span class="pill">已停用</span>' : ''}
+        <div class="muted small">${esc(t.nextAtText2 || '')}</div></td>
+      <td>${esc(schWhenText(t))}</td>
+      <td>${esc(SCH_ACTION_TEXT[(t.action || {}).kind] || (t.action || {}).kind || '—')}</td>
+      <td>${esc(schRoomText(t))}${(t.target && t.target.at) ? ' <span class="pill">@' + esc(t.target.at) + '</span>' : ''}</td>
+      <td class="small">${nextAt ? esc(new Date(nextAt).toLocaleString()) : '<span class="muted">—</span>'}</td>
+      <td class="small"${errTitle}>${t.lastRunAt ? esc(fmtTime(t.lastRunAt)) + ' ' + mark : '<span class="muted">—</span>'}</td>
+      <td class="small"><button class="btn" data-sch-toggle="${esc(t.id)}">${t.enabled === false ? '启用' : '停用'}</button>
+        <button class="btn" data-sch-run="${esc(t.id)}">立即执行</button>
+        <button class="btn" data-sch-edit="${esc(t.id)}">编辑</button>
+        <button class="btn danger" data-sch-del="${esc(t.id)}">删除</button></td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="7"><div class="empty">还没有定时任务 —— 在下面「新增任务」里加一个。</div></td></tr>';
+
+  // ── 运行日志 ──────────────────────────────────────────
+  const logRows = log.length ? log.slice(0, 50).map(r => `<tr>
+      <td class="small">${esc(r.at ? fmtTime(r.at) : '—')}</td>
+      <td>${esc(r.name || '')}</td>
+      <td>${r.ok === true ? '✅' : '❌'}</td>
+      <td class="small">${esc(r.ok ? String(r.preview || '').slice(0, 60) : String(r.error || '').slice(0, 60))}</td>
+    </tr>`).join('') : '<tr><td colspan="4"><div class="empty">还没有运行记录</div></td></tr>';
+
+  view.innerHTML = `<h2>定时任务 ⏰ <span class="muted small">到点自动发到群里</span></h2>
+    <div class="section"><div class="hd">⚙️ 总开关</div>
+      <div class="row">
+        <label class="hswitch" title="关掉后所有定时任务都不再触发">
+          定时任务总开关 <span class="sw"><input type="checkbox" id="sch-master" ${cfg.schedulerEnabled === false ? '' : 'checked'}><i></i></span></label>
+        <button class="btn" id="sch-reload">刷新</button>
+        <span class="muted small">数据存在插件目录 schedules.json，重启不丢。当前服务器时间：<b>${esc(serverTime)}</b>（按这个时间算「几点」）。</span>
+      </div>
+      <div class="small muted" style="margin-top:8px">到点自动发到群里：每天播天气、提醒打卡签到、自定义提醒……</div></div>
+
+    <div class="section"><div class="hd">📋 任务列表 <span class="muted">${tasks.length} 个</span></div>
+      <table class="table"><thead><tr><th>名称</th><th>时间</th><th>动作</th><th>目标群</th><th>下次运行</th><th>上次结果</th><th>操作</th></tr></thead>
+        <tbody>${taskRows}</tbody></table></div>
+
+    <div class="section" id="sch-form"><div class="hd">➕ <span id="sch-form-title">新增任务</span>
+        <span class="muted" id="sch-form-hint"></span></div>
+      <div class="field"><div class="lab">名称</div><div class="ctl">
+        <input id="sch-name" type="text" placeholder="比如：早上播天气" style="flex:1;min-width:240px"></div></div>
+      <div class="field"><div class="lab">启用</div><div class="ctl">
+        <label class="hswitch"><span class="sw"><input type="checkbox" id="sch-enabled" checked><i></i></span> 到点就发</label></div></div>
+      <div class="field"><div class="lab">时间类型</div><div class="ctl">
+        <select id="sch-when-kind">
+          <option value="daily">每天</option>
+          <option value="weekly">每周（可多选星期）</option>
+          <option value="interval">每隔 N 分钟</option>
+          <option value="once">只跑一次</option>
+          <option value="cron">Cron 表达式</option>
+        </select></div></div>
+      <div class="field" id="sch-when-daily"><div class="lab">时间</div><div class="ctl">
+        <input id="sch-time" type="time" value="09:00"></div></div>
+      <div class="field" id="sch-when-weekly" style="display:none"><div class="lab">时间 / 星期</div><div class="ctl">
+        <input id="sch-wtime" type="time" value="09:00">
+        <div class="chips">${SCH_WD.map(([v, n]) => `<label class="chip"><input type="checkbox" data-wd="${v}"> 周${n}</label>`).join('')}</div></div></div>
+      <div class="field" id="sch-when-interval" style="display:none"><div class="lab">间隔</div><div class="ctl">
+        每 <input id="sch-interval" type="number" min="1" step="1" value="60" style="width:100px"> 分钟</div></div>
+      <div class="field" id="sch-when-once" style="display:none"><div class="lab">时间点</div><div class="ctl">
+        <input id="sch-once" type="datetime-local"></div></div>
+      <div class="field" id="sch-when-cron" style="display:none"><div class="lab">Cron</div><div class="ctl">
+        <input id="sch-cron" type="text" placeholder="0 9 * * *" style="flex:1;min-width:220px"></div>
+        <div class="help">分 时 日 月 周；<code>*</code> 任意，<code>*/10</code> 每 10 分钟，<code>1-5</code> 周一到周五</div></div>
+      <div class="field"><div class="lab">动作</div><div class="ctl">
+        <select id="sch-action">
+          <option value="weather">查天气（真的去查）</option>
+          <option value="text">固定文案（原样发）</option>
+          <option value="llm">AI 现写（凭空写，没有实时数据）</option>
+          <option value="search">联网查（真的去搜）</option>
+        </select></div>
+        <div class="help" id="sch-action-help"></div></div>
+      <div class="field" id="sch-act-weather"><div class="lab">城市</div><div class="ctl">
+        <input id="sch-city" type="text" placeholder="${esc(cfg.weatherCity || '石河子')}" style="min-width:180px">
+        <label class="hswitch"><span class="sw"><input type="checkbox" id="sch-polish"><i></i></span> 让 AI 用机器人的语气润色</label></div>
+        <div class="help">先拉真实天气（open-meteo），再交给 AI 改写成她的语气 —— 数据不会被捏造</div></div>
+      <div class="field" id="sch-act-hint" style="display:none"><div class="lab">额外要求</div><div class="ctl">
+        <textarea id="sch-hint" style="min-height:60px" placeholder="例：要带当日天气、当天运势、穿衣建议、开车注意事项"></textarea></div>
+        <div class="help">写给 AI 润色的附加要求（只有勾了「AI 润色」才生效）</div></div>
+      <div class="field" id="sch-act-text" style="display:none"><div class="lab">固定文案</div><div class="ctl">
+        <textarea id="sch-text" style="min-height:90px" placeholder="到点原样发这段话"></textarea></div></div>
+      <div class="field" id="sch-act-llm" style="display:none"><div class="lab">提示词</div><div class="ctl">
+        <textarea id="sch-prompt" style="min-height:90px" placeholder="提醒我去打卡签到，用你的语气，一句话"></textarea></div>
+        <div class="help">⚠️ AI 现写<b>不会</b>联网、<b>不会</b>查天气 —— 要真实数据请选「查天气 / 联网查」</div></div>
+      <div class="field" id="sch-act-search" style="display:none"><div class="lab">查询词</div><div class="ctl">
+        <input id="sch-query" type="text" placeholder="今天有什么新闻" style="flex:1;min-width:200px">
+        <label class="hswitch"><span class="sw"><input type="checkbox" id="sch-polish-s"><i></i></span> AI 润色</label></div></div>
+      <div class="field"><div class="lab">发到哪个群</div><div class="ctl">
+        <select id="sch-room" style="min-width:240px"></select><span class="muted small">不选 = 默认群</span></div></div>
+      <div class="field"><div class="lab">@ 某人</div><div class="ctl">
+        <input id="sch-at" type="text" placeholder="昵称，可留空" style="min-width:180px">
+        <label class="hswitch"><span class="sw"><input type="checkbox" id="sch-sticker"><i></i></span> 附带一张表情包</label></div></div>
+      <div class="field"><div class="lab">安静时段</div><div class="ctl">
+        <label class="hswitch" title="勾上：即使是睡觉时段也照发"><span class="sw"><input type="checkbox" id="sch-ignore-quiet" checked><i></i></span> 忽略安静时段</label>
+        <span class="muted small">勾上 = 睡觉时段也照发</span></div></div>
+      <div class="row" style="padding:10px 0">
+        <button class="btn primary" id="sch-save">保存</button>
+        <button class="btn" id="sch-preview" title="不落库，只算下次什么时候跑">预览下次时间</button>
+        <button class="btn" id="sch-cancel" style="display:none">取消编辑</button>
+        <span id="sch-msg" class="small muted"></span></div></div>
+
+    <div class="section"><div class="hd">🧾 运行日志 <span class="muted">最近 ${Math.min(log.length, 50)} 条</span></div>
+      <div class="row" style="margin-bottom:8px"><button class="btn danger" id="sch-clear-log">清空日志</button></div>
+      <table class="table"><thead><tr><th>时间</th><th>任务</th><th>结果</th><th>摘要</th></tr></thead>
+        <tbody>${logRows}</tbody></table></div>`;
+
+  /* ── 事件绑定（全部在 innerHTML 之后绑，不用内联 onclick）── */
+
+  // 总开关：直接改配置项 schedulerEnabled
+  $('#sch-master').onchange = async (e) => {
+    const on = e.target.checked;
+    try {
+      await api('/config', { method:'POST', body: JSON.stringify({ patch:{ schedulerEnabled:on } }) });
+      App.S.config.schedulerEnabled = on;
+      toast(on ? '定时任务已启用' : '定时任务已停用', on ? 'ok' : 'err');
+    } catch (err) { e.target.checked = !on; toast(err.message, 'err'); }
+  };
+  // 刷新：先用 schedule.list 拿一份（顺带验证接口通不通），再重拉 /state 重绘
+  $('#sch-reload').onclick = async () => {
+    try {
+      const j = await api('/action', { method:'POST', body: JSON.stringify({ op:'schedule.list', args:{} }) });
+      const r = j.result || {};
+      App.scheduleFallback = { tasks: r.tasks || [], log: r.log || [] };
+    } catch (e) { /* 后端还没这个 op 也不影响，下面照常 refresh */ }
+    await refresh();
+  };
+  // /state 里没有 schedules（lib 未注入）时，自动兜底拉一次，只拉一次避免重绘打转
+  if (!Array.isArray(S.schedules) && !App.scheduleFallbackTried) {
+    App.scheduleFallbackTried = true;
+    api('/action', { method:'POST', body: JSON.stringify({ op:'schedule.list', args:{} }) })
+      .then(j => {
+        const r = j.result || {};
+        App.scheduleFallback = { tasks: r.tasks || [], log: r.log || [] };
+        if (App.tab === 'schedule') renderActive({});
+      })
+      .catch(() => {});
+  }
+
+  // 群下拉：和「手动操作」页同一个 fillRoomSelect，空 = 默认群
+  fillRoomSelect($('#sch-room'), true);
+  ensureBridgeRooms().then(() => fillRoomSelect($('#sch-room'), true));
+
+  // 按类型显示/隐藏字段容器
+  const syncWhenRows = () => {
+    const k = $('#sch-when-kind').value;
+    for (const kk of ['daily', 'weekly', 'interval', 'once', 'cron']) {
+      const box = $('#sch-when-' + kk);
+      if (box) box.style.display = kk === k ? '' : 'none';
+    }
+    // 两个时间框互相兜个底，切类型时不用重填
+    if (k === 'weekly' && !$('#sch-wtime').value && $('#sch-time').value) $('#sch-wtime').value = $('#sch-time').value;
+    if (k === 'daily' && !$('#sch-time').value && $('#sch-wtime').value) $('#sch-time').value = $('#sch-wtime').value;
+  };
+  const SCH_ACTION_HELP = {
+    weather: '✅ 会真的去查：先拉真实天气数据，再让 AI 改写语气',
+    text: '原样发你写的这段话，不经过 AI',
+    llm: '⚠️ 只是让 AI 凭空写一句话 —— 不联网、查不到真实天气/新闻',
+    search: '✅ 会真的去搜：先联网查，再让 AI 挑重点说',
+  };
+  const syncActionRows = () => {
+    const k = $('#sch-action').value;
+    for (const kk of ['weather', 'text', 'llm', 'search']) {
+      const box = $('#sch-act-' + kk);
+      if (box) box.style.display = kk === k ? '' : 'none';
+    }
+    // 「额外要求」只给有 AI 润色的动作（weather / search）
+    const hintBox = $('#sch-act-hint');
+    if (hintBox) hintBox.style.display = (k === 'weather' || k === 'search') ? '' : 'none';
+    const help = $('#sch-action-help');
+    if (help) help.innerHTML = SCH_ACTION_HELP[k] || '';
+  };
+  $('#sch-when-kind').onchange = syncWhenRows;
+  $('#sch-action').onchange = syncActionRows;
+  syncWhenRows();
+  syncActionRows();
+
+  /** 把表单收成一个 task 对象；必填项没填就抛中文错误。 */
+  const collectTask = () => {
+    const name = $('#sch-name').value.trim();
+    if (!name) throw new Error('先给任务起个名字');
+    const kind = $('#sch-when-kind').value;
+    const when = { kind };
+    if (kind === 'daily') when.time = $('#sch-time').value || '09:00';
+    if (kind === 'weekly') {
+      when.time = $('#sch-wtime').value || $('#sch-time').value || '09:00';
+      when.weekdays = $$('[data-wd]', view).filter(x => x.checked).map(x => Number(x.dataset.wd));
+      if (!when.weekdays.length) throw new Error('每周任务至少勾一天');
+    }
+    if (kind === 'interval') {
+      when.everyMinutes = Number($('#sch-interval').value) || 0;
+      if (when.everyMinutes < 1) throw new Error('间隔分钟数要 ≥ 1');
+    }
+    if (kind === 'once') {
+      when.at = schLocalMs($('#sch-once').value);
+      if (!when.at) throw new Error('选一个要执行的时间点');
+    }
+    if (kind === 'cron') {
+      when.cron = $('#sch-cron').value.trim();
+      if (!when.cron) throw new Error('填一个 cron 表达式，比如 0 9 * * *');
+    }
+    const akind = $('#sch-action').value;
+    const action = { kind: akind };
+    if (akind === 'weather') { action.city = $('#sch-city').value.trim(); action.polish = $('#sch-polish').checked; }
+    if (akind === 'text') {
+      action.text = $('#sch-text').value;
+      if (!action.text.trim()) throw new Error('固定文案不能为空');
+    }
+    if (akind === 'llm') {
+      action.prompt = $('#sch-prompt').value;
+      if (!action.prompt.trim()) throw new Error('提示词不能为空');
+    }
+    if (akind === 'search') {
+      action.query = $('#sch-query').value.trim();
+      if (!action.query) throw new Error('查询词不能为空');
+      action.polish = $('#sch-polish-s').checked;
+    }
+    // 额外要求：给 AI 润色用的附加指令（2026-10-30）
+    if (akind === 'weather' || akind === 'search') {
+      const hint = ($('#sch-hint')?.value || '').trim();
+      if (hint) action.hint = hint.slice(0, 300);
+    }
+    const room = ($('#sch-room').value === '__manual') ? '' : ($('#sch-room').value || '');
+    const task = {
+      name, enabled: $('#sch-enabled').checked,
+      when, action,
+      target: { room, at: $('#sch-at').value.trim(), sticker: $('#sch-sticker').checked },
+      ignoreQuiet: $('#sch-ignore-quiet').checked,
+    };
+    if (App.scheduleEditId) task.id = App.scheduleEditId;   // 带 id = 更新，不带 = 新建
+    return task;
+  };
+
+  // 保存
+  $('#sch-save').onclick = async () => {
+    let task;
+    try { task = collectTask(); } catch (e) { return toast(e.message, 'err'); }
+    $('#sch-save').disabled = true;
+    try {
+      const j = await api('/action', { method:'POST', body: JSON.stringify({ op:'schedule.save', args:{ task } }) });
+      toast('已保存：' + ((j.result && j.result.task && j.result.task.name) || task.name), 'ok');
+      App.scheduleEditId = null;
+      await refresh();
+    } catch (e) { toast('保存失败：' + e.message, 'err'); $('#sch-msg').textContent = e.message; }
+    finally { $('#sch-save').disabled = false; }
+  };
+
+  // 预览：不落库，只算下次什么时候跑
+  $('#sch-preview').onclick = async () => {
+    let task;
+    try { task = collectTask(); } catch (e) { return toast(e.message, 'err'); }
+    delete task.id;
+    $('#sch-msg').textContent = '计算中…';
+    try {
+      const j = await api('/action', { method:'POST', body: JSON.stringify({ op:'schedule.preview', args:{ task } }) });
+      const r = j.result || {};
+      const when = r.nextRunAt ? new Date(Number(r.nextRunAt)).toLocaleString() : '（算不出下次时间）';
+      $('#sch-msg').textContent = '下次：' + (r.describe || '') + ' → ' + when;
+      toast('下次：' + when, 'ok');
+    } catch (e) { $('#sch-msg').textContent = '预览失败：' + e.message; toast('预览失败：' + e.message, 'err'); }
+  };
+
+  // 取消编辑 → 清空表单回到「新增」
+  $('#sch-cancel').onclick = () => { schFillForm(null); };
+
+  // 列表里的行内按钮
+  $$('[data-sch-toggle]', view).forEach(b => b.onclick = async () => {
+    const id = b.dataset.schToggle;
+    const t = tasks.find(x => String(x.id) === String(id));
+    const enabled = !(t && t.enabled !== false);
+    try {
+      await api('/action', { method:'POST', body: JSON.stringify({ op:'schedule.toggle', args:{ id, enabled } }) });
+      toast(enabled ? '已启用' : '已停用', 'ok');
+      await refresh();
+    } catch (e) { toast('操作失败：' + e.message, 'err'); }
+  });
+  $$('[data-sch-run]', view).forEach(b => b.onclick = async () => {
+    const id = b.dataset.schRun;
+    const t = tasks.find(x => String(x.id) === String(id));
+    if (!confirm('立即执行「' + ((t && t.name) || id) + '」？\n\n会真的发到群里。')) return;
+    b.disabled = true;
+    try {
+      const j = await api('/action', { method:'POST', body: JSON.stringify({ op:'schedule.run', args:{ id } }) });
+      const r = j.result || {};
+      if (r.ok === false) toast('执行失败：' + (r.error || '未知原因'), 'err');
+      else toast('已执行：' + String(r.preview || '').slice(0, 60), 'ok');
+      await refresh();
+    } catch (e) { toast('执行失败：' + e.message, 'err'); }
+    finally { b.disabled = false; }
+  });
+  $$('[data-sch-edit]', view).forEach(b => b.onclick = () => {
+    const t = tasks.find(x => String(x.id) === String(b.dataset.schEdit));
+    if (t) schFillForm(t);
+  });
+  $$('[data-sch-del]', view).forEach(b => b.onclick = async () => {
+    const id = b.dataset.schDel;
+    const t = tasks.find(x => String(x.id) === String(id));
+    if (!confirm('删除任务「' + ((t && t.name) || id) + '」？')) return;
+    try {
+      await api('/action', { method:'POST', body: JSON.stringify({ op:'schedule.remove', args:{ id } }) });
+      if (String(App.scheduleEditId) === String(id)) App.scheduleEditId = null;
+      toast('已删除', 'ok');
+      await refresh();
+    } catch (e) { toast('删除失败：' + e.message, 'err'); }
+  });
+
+  $('#sch-clear-log').onclick = async () => {
+    if (!confirm('清空运行日志？（只清日志，不动任务）')) return;
+    try {
+      await api('/action', { method:'POST', body: JSON.stringify({ op:'schedule.clearLog', args:{} }) });
+      toast('日志已清空', 'ok');
+      await refresh();
+    } catch (e) { toast('清空失败：' + e.message, 'err'); }
+  };
+
+  // 进页面时如果正处在编辑态（比如刷新后），把表单填回去
+  if (App.scheduleEditId) {
+    const t = tasks.find(x => String(x.id) === String(App.scheduleEditId));
+    if (t) schFillForm(t);
+  }
+
+  /** 把任务填进表单；传 null = 回到「新增任务」空表单。 */
+  function schFillForm(t) {
+    App.scheduleEditId = t ? t.id : null;
+    const when = (t && t.when) || {};
+    const act = (t && t.action) || {};
+    const tgt = (t && t.target) || {};
+    $('#sch-name').value = (t && t.name) || '';
+    $('#sch-enabled').checked = !(t && t.enabled === false);
+    $('#sch-when-kind').value = when.kind || 'daily';
+    $('#sch-time').value = when.time || '09:00';
+    $('#sch-wtime').value = when.time || '09:00';
+    $('#sch-interval').value = when.everyMinutes || 60;
+    $('#sch-once').value = when.at ? schToLocalInput(when.at) : '';
+    $('#sch-cron').value = when.cron || '';
+    const wds = new Set((when.weekdays || []).map(Number));
+    $$('[data-wd]', view).forEach(x => { x.checked = wds.has(Number(x.dataset.wd)); });
+    $('#sch-action').value = act.kind || 'weather';
+    $('#sch-city').value = act.city || '';
+    $('#sch-polish').checked = !!act.polish;
+    $('#sch-polish-s').checked = !!act.polish;
+    $('#sch-text').value = act.text || '';
+    $('#sch-prompt').value = act.prompt || '';
+    $('#sch-query').value = act.query || '';
+    $('#sch-hint').value = act.hint || '';
+    $('#sch-at').value = tgt.at || '';
+    $('#sch-sticker').checked = !!tgt.sticker;
+    $('#sch-ignore-quiet').checked = !(t && t.ignoreQuiet === false);
+    if (tgt.room && Array.from($('#sch-room').options).some(o => o.value === tgt.room)) $('#sch-room').value = tgt.room;
+    syncWhenRows();
+    syncActionRows();
+    $('#sch-form-title').textContent = t ? ('编辑：' + (t.name || '')) : '新增任务';
+    $('#sch-cancel').style.display = t ? '' : 'none';
+    $('#sch-msg').textContent = '';
+    const form = document.getElementById('sch-form');
+    if (form && t) form.scrollIntoView({ behavior:'smooth' });
+  }
+}
+
+/** 毫秒时间戳 → datetime-local 需要的本地时间字符串（YYYY-MM-DDTHH:mm）。 */
+function schToLocalInput(ms) {
+  const d = new Date(Number(ms) || 0);
+  if (isNaN(d.getTime())) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' + p(d.getHours()) + ':' + p(d.getMinutes());
 }
 
 /* ── 启动 ─────────────────────────────────────────────── */

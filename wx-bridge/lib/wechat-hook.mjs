@@ -21,6 +21,8 @@ import { copyFileSync, existsSync, mkdirSync, writeFileSync, readFileSync, readd
 import { join, dirname } from 'node:path'
 import { mark as fMark } from './forensics.mjs'
 import { tmpdir } from 'node:os'
+import { resolvePythonExe } from './python-runtime.mjs'
+import { ffmpegExe } from './link-video.mjs'
 
 // ── 高分辨率图片提供者（hires provider）────────────────────────────────────
 //   本机可选安装一个「提供者」（不随本项目分发），它会把全分辨率的图写到这个目录。
@@ -1387,7 +1389,8 @@ export class WeChatHookBridge {
             if (!r) {
               this.log(`解密失败（${c.label}），尝试重扫图片密钥…`)
               try {
-                execFileSync(process.env.PYTHON_EXE || 'D:\\Python311\\python.exe',
+                const py = resolvePythonExe()
+                if (py) execFileSync(py,
                   [join(dirname(fileURLToPath(import.meta.url)), 'decode-wechat-image.py'), '--find-key'],
                   { windowsHide: true, timeout: 300_000, stdio: 'ignore' })
               } catch { /* ignore */ }
@@ -1446,9 +1449,8 @@ export class WeChatHookBridge {
   /** GIF 表情 → 首帧 PNG（识图链路不吃 GIF；GIF 本体仍留给表情库） */
   gifToPng(gifPath) {
     try {
-      const ff = process.env.FFMPEG_EXE
-        || 'D:\\Python311\\Lib\\site-packages\\imageio_ffmpeg\\binaries\\ffmpeg-win-x86_64-v7.1.exe'
-      if (!existsSync(ff)) return ''
+      const ff = process.env.FFMPEG_EXE || ffmpegExe()
+      if (!ff || !existsSync(ff)) return ''
       const out = gifPath.replace(/\.gif$/i, '') + '-frame0.png'
       execFileSync(ff, ['-hide_banner', '-loglevel', 'error', '-y', '-i', gifPath,
         '-frames:v', '1', out], { timeout: 20_000, stdio: 'ignore' })

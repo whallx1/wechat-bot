@@ -30,6 +30,7 @@ import { WxhelperBridge } from './lib/wxhelper.mjs'
 import { WeChatHookBridge } from './lib/wechat-hook.mjs'
 import { fetchDirectVideoSheet, fetchLinkVideoSheet, pruneLinkVideoTemp } from './lib/link-video.mjs'
 import { generateStickerImage, listEmotions, autoBubble } from './lib/genimage.mjs'
+import { resolvePythonExe, pythonHint } from './lib/python-runtime.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const argv = process.argv.slice(2)
@@ -189,7 +190,25 @@ const events = {
 }
 
 let bridge
-const TRANSPORT = opt('transport', MOCK ? 'mock' : 'wxhelper')
+function detectTransport() {
+  const apiPort = Number(opt('api-port', '30001'))
+  const portListening = (p) => {
+    try {
+      const out = execFileSync('netstat', ['-ano'], { encoding: 'utf8', timeout: 8000, windowsHide: true })
+      return new RegExp(':' + p + '\\s+\\S+\\s+LISTENING', 'i').test(out)
+    } catch { return false }
+  }
+  const wechatExe = opt('wechat', '')
+  const exeDir = wechatExe ? dirname(wechatExe) : ''
+  const dllDir = opt('dll', '') ? dirname(opt('dll', '')) : ''
+  const candidates = [exeDir, dllDir, 'D:\\wxhook\\wx4110', 'D:\\wxhook\\wx4110\\4.1.10.27'].filter(Boolean)
+  for (const d of candidates) {
+    try { if (statSync(join(d, 'version.dll')).size > 0) return 'wechat-hook' } catch { /* next */ }
+  }
+  if (portListening(apiPort)) return 'wechat-hook'
+  return 'wxhelper'
+}
+const TRANSPORT = opt('transport', '') || (MOCK ? 'mock' : detectTransport())
 if (MOCK) {
   bridge = new MockBridge({ emit: (e, p) => events[e]?.(p), stickers, dataDir: DATA_DIR, autoChat: true })
   bridge.start()
@@ -229,7 +248,11 @@ if (MOCK) {
     httpPort: Number(opt('cb-port', '18998')),
     stickers, dataDir: DATA_DIR,
     dllPath: opt('dll', 'D:\\wxhook\\wxhook.dll'),
-    pythonExe: opt('python', 'D:\\Python311\\python.exe'),
+    // ★ 2026-10-28：这里原来传过 pythonExe（**桥构造器的入参**，默认写死 D:\Python311\python.exe），
+    //   但 WxhelperBridge 从来没用过它（注入走 inject.mjs，不需要 Python）→ 死传参已删。
+    //   ⚠️ 与 config.json 顶层的 pythonExe 无关：那个是 pythonPath 的**兼容别名、仍在生效**
+    //      （由 lib/python-runtime.mjs 的 CONFIG_KEYS 读取）。
+    //   桥里真正需要 Python 的地方（addBubble / 刷抖音等）都走 python-runtime 解析器。
     injector: opt('injector', 'D:\\wxhook\\inject_ctypes.py'),
     wechatExe: opt('wechat', 'D:\\wxhook\\weixin-run\\Weixin.exe'),
     emit: (e, p) => events[e]?.(p),
@@ -322,9 +345,13 @@ async function processGenRetry() {
       if (bubble) {
         const out = r.file.replace(/\.(jpg|jpeg|png)$/i, '') + '-bubble.png'
         try {
-          execFileSync(process.env.PYTHON_EXE || 'D:\\Python311\\python.exe',
-            [join(ROOT_DIR, 'add-bubble.py'), r.file, out, bubble, '--pos', 'top'], { windowsHide: true, stdio: 'ignore', timeout: 30_000 })
-          file = out
+          const py = resolvePythonExe()
+          if (!py) log('加气泡跳过：没找到可用的 Python（' + pythonHint() + '）')
+          else {
+            execFileSync(py,
+              [join(ROOT_DIR, 'add-bubble.py'), r.file, out, bubble, '--pos', 'top'], { windowsHide: true, stdio: 'ignore', timeout: 30_000 })
+            file = out
+          }
         } catch { /* 气泡失败就用原图 */ }
       }
       stickers.add({ srcPath: file, context: ('agnes生成 ' + emotion + ' ' + job.extra + ' ' + bubble).trim(), kind: 'image', source: 'gen', senderName: 'AI 生成' })
@@ -676,7 +703,9 @@ async function handle(op, a = {}) {
       const outDir = join(here, '..', 'data', '_douyin', 'batch-' + Date.now())
       try { mkdirSync(outDir, { recursive: true }) } catch { /* ignore */ }
       try {
-        const py = process.env.PYTHON_EXE || 'D:\\Python311\\python.exe'
+        const py = resolvePythonExe()
+        if (!py) return { ok: false, error: '没找到可用的 Python；' + pythonHint(), dir: outDir }
+        if (!existsSync(script)) return { ok: false, error: '脚本不存在：' + script, dir: outDir }
         // ★ 必须异步：这个脚本要跑 1~2 分钟，用 execFileSync 会把桥的事件循环卡死
         //   （实测：WS 客户端直接超时、插件收不到消息）。
         await new Promise((resolve, reject) => {
@@ -710,7 +739,8 @@ async function handle(op, a = {}) {
       const text = String(a.text || '').trim()
       if (!src || !text) return { ok: false, error: '需要 file 和 text' }
       const out = src.replace(/\.(jpg|jpeg|png)$/i, '') + '-bubble.png'
-      const py = process.env.PYTHON_EXE || 'D:\\Python311\\python.exe'
+      const py = resolvePythonExe()
+      if (!py) return { ok: false, error: '没找到可用的 Python；' + pythonHint() }
       try {
         execFileSync(py, [join(ROOT_DIR, 'add-bubble.py'), src, out, text, '--pos', String(a.pos || 'top')], { windowsHide: true, stdio: 'ignore', timeout: 30_000 })
         const item = stickers.add({ srcPath: out, context: '气泡 ' + text, kind: 'image', source: 'gen', senderName: 'AI 生成' })
@@ -752,12 +782,16 @@ async function handle(op, a = {}) {
       }
       if (bubble) {
         const out = r.file.replace(/\.(jpg|jpeg|png)$/i, '') + '-bubble.png'
-        const py = process.env.PYTHON_EXE || 'D:\\Python311\\python.exe'
+        const py = resolvePythonExe()
         const script = join(ROOT_DIR, 'add-bubble.py')
         try {
+          if (!py) {
+            log('加气泡跳过：没找到可用的 Python（' + pythonHint() + '）')
+          } else {
           execFileSync(py, [script, r.file, out, bubble, '--pos', String(a.bubblePos || 'top')], { windowsHide: true, stdio: 'ignore', timeout: 30_000 })
           file = out
           log(`已加文字气泡「${bubble}」→ ${out}`)
+          }
         } catch (e) {
           log('加气泡失败（用无气泡版本）：' + String(e?.message || e))
         }
